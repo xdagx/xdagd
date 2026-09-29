@@ -1,0 +1,238 @@
+//! Node configuration (TOML).
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use xdag_types::{Nano, Network, NetworkParams};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeConfig {
+    pub network: Network,
+    pub datadir: PathBuf,
+    pub node_tag: String,
+    pub p2p: P2pConfig,
+    pub rpc: RpcConfig,
+    pub pool: PoolConfig,
+    pub mining: MiningConfig,
+    pub nova: NovaOverrides,
+    pub randomx: RandomXConfig,
+    pub wallet: WalletConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct P2pConfig {
+    pub listen: SocketAddr,
+    pub advertise_port: Option<u16>,
+    /// Seed nodes to bootstrap from. There is no whitelist: anyone may connect.
+    pub seeds: Vec<String>,
+    pub max_inbound: usize,
+    pub max_outbound: usize,
+    pub max_inbound_per_ip: usize,
+    /// Accept private addresses from peer exchange (local devnets).
+    pub allow_private: bool,
+    /// Optional local deny list.
+    pub deny: Vec<IpAddr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RpcConfig {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+    pub cors_origin: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PoolConfig {
+    /// WebSocket interface for external pool software (xdagj `pool.ws.port`).
+    pub enabled: bool,
+    pub listen: SocketAddr,
+    /// Pools allowed to connect to *this* node (0.0.0.0 = any). This is the
+    /// operator's own node↔pool link, not a network membership rule.
+    pub allowed: Vec<IpAddr>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MiningConfig {
+    /// Produce main-block candidates, link blocks and Nova batch blocks.
+    pub generate_blocks: bool,
+    /// Built-in CPU miner threads (0 = rely on external pools).
+    pub threads: usize,
+    pub fund_address: Option<String>,
+    pub fund_percent: f64,
+    pub node_percent: f64,
+    /// Seconds between Nova batch blocks when transactions are pending.
+    pub batch_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NovaOverrides {
+    pub activation_epoch: Option<u64>,
+    pub chain_id: Option<u64>,
+    pub min_link_pow_bits: Option<u32>,
+    pub min_gas_price: Option<u128>,
+    pub min_native_fee: Option<String>,
+    /// Devnets only: shorter epochs (xdag ticks per epoch = 2^epoch_bits).
+    pub epoch_bits: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RandomXConfig {
+    /// Fast mode (2 GiB dataset); light mode (256 MiB) otherwise.
+    pub full_mem: bool,
+    /// Disable RandomX (devnets that never reach the fork height).
+    pub disabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalletConfig {
+    /// Path of an xdagj-compatible wallet.data (default: <datadir>/wallet/wallet.data).
+    pub path: Option<PathBuf>,
+    /// Password for non-interactive use (prefer the XDAG_WALLET_PASSWORD env var).
+    pub password: Option<String>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self::for_network(Network::Devnet)
+    }
+}
+
+impl NodeConfig {
+    /// Parse a TOML file on top of the defaults of the network it names.
+    pub fn from_toml(text: &str) -> anyhow::Result<Self> {
+        let user: toml::Value = toml::from_str(text)?;
+        let network = match user.get("network").and_then(|v| v.as_str()) {
+            Some("mainnet") => Network::Mainnet,
+            Some("testnet") => Network::Testnet,
+            Some("devnet") | None => Network::Devnet,
+            Some(other) => anyhow::bail!("unknown network {other}"),
+        };
+        let mut base = toml::Value::try_from(Self::for_network(network))?;
+        merge(&mut base, user);
+        Ok(base.try_into()?)
+    }
+
+    pub fn for_network(n: Network) -> Self {
+        let p = NetworkParams::for_network(n);
+        NodeConfig {
+            network: n,
+            datadir: PathBuf::from(format!("./data-{}", n.name())),
+            node_tag: "xdag-rs".into(),
+            p2p: P2pConfig {
+                listen: format!("0.0.0.0:{}", p.default_p2p_port).parse().unwrap(),
+                advertise_port: None,
+                seeds: p.seeds.clone(),
+                max_inbound: 128,
+                max_outbound: 16,
+                max_inbound_per_ip: 4,
+                allow_private: n == Network::Devnet,
+                deny: vec![],
+            },
+            rpc: RpcConfig { enabled: true, listen: format!("127.0.0.1:{}", p.default_rpc_port).parse().unwrap(), cors_origin: None },
+            pool: PoolConfig {
+                enabled: false,
+                listen: format!("127.0.0.1:{}", p.default_pool_port).parse().unwrap(),
+                allowed: vec!["127.0.0.1".parse().unwrap()],
+            },
+            mining: MiningConfig {
+                generate_blocks: false,
+                threads: 0,
+                fund_address: None,
+                fund_percent: 5.0,
+                node_percent: 5.0,
+                batch_interval_ms: 1000,
+            },
+            nova: NovaOverrides::default(),
+            randomx: RandomXConfig { full_mem: false, disabled: n == Network::Devnet },
+            wallet: WalletConfig::default(),
+        }
+    }
+
+    pub fn params(&self) -> anyhow::Result<NetworkParams> {
+        let mut p = NetworkParams::for_network(self.network);
+        if let Some(bits) = self.nova.epoch_bits {
+            anyhow::ensure!(self.network == Network::Devnet, "epoch_bits can only be changed on devnets");
+            anyhow::ensure!((8..=16).contains(&bits), "epoch_bits must be within 8..=16");
+            p.epoch_bits = bits;
+        }
+        let o = &self.nova;
+        if o.activation_epoch.is_some()
+            || o.chain_id.is_some()
+            || o.min_link_pow_bits.is_some()
+            || o.min_gas_price.is_some()
+            || o.min_native_fee.is_some()
+        {
+            let mut n = p.nova.clone().unwrap_or_else(|| xdag_types::NovaParams::defaults(o.chain_id.unwrap_or(30820)));
+            if let Some(v) = o.activation_epoch {
+                n.activation_epoch = v;
+            }
+            if let Some(v) = o.chain_id {
+                n.chain_id = v;
+            }
+            if let Some(v) = o.min_link_pow_bits {
+                n.min_link_pow_bits = v;
+            }
+            if let Some(v) = o.min_gas_price {
+                n.min_gas_price = v;
+            }
+            if let Some(v) = &o.min_native_fee {
+                n.min_native_fee = Nano::parse_xdag(v).map_err(|e| anyhow::anyhow!("min_native_fee: {e}"))?;
+            }
+            p.nova = Some(n);
+        }
+        if let Some(f) = &self.mining.fund_address {
+            p.fund_address = f.clone();
+        }
+        Ok(p)
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.datadir.join("chain.redb")
+    }
+
+    pub fn wallet_path(&self) -> PathBuf {
+        self.wallet.path.clone().unwrap_or_else(|| self.datadir.join("wallet").join("wallet.data"))
+    }
+
+    pub fn node_key_path(&self) -> PathBuf {
+        self.datadir.join("node.key")
+    }
+}
+
+fn merge(base: &mut toml::Value, user: toml::Value) {
+    match (base, user) {
+        (toml::Value::Table(b), toml::Value::Table(u)) => {
+            for (k, v) in u {
+                match b.get_mut(&k) {
+                    Some(bv) => merge(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, u) => *b = u,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_overrides_network_defaults() {
+        let c = NodeConfig::from_toml("network = \"mainnet\"\n[p2p]\nseeds = [\"1.2.3.4:8001\"]\n").unwrap();
+        assert_eq!(c.network, Network::Mainnet);
+        assert_eq!(c.p2p.listen.port(), 8001);
+        assert_eq!(c.rpc.listen.port(), 10001);
+        assert_eq!(c.p2p.seeds, vec!["1.2.3.4:8001".to_string()]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        let again = NodeConfig::from_toml(&text).unwrap();
+        assert_eq!(again.p2p.seeds, c.p2p.seeds);
+    }
+}

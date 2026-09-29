@@ -1,0 +1,23 @@
+[package]
+name = "xdag-chain"
+description = "XDAG consensus: DAG insertion, main-chain selection, execution (legacy + Nova)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xdag-types.workspace = true
+xdag-storage.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+lru.workspace = true
+rayon.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

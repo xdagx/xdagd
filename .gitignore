@@ -1,0 +1,20 @@
+# build output
+/target/
+
+# editor files
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# local node data and keys (xdagd's default datadir is ./data-<network>)
+/data-*/
+node.key
+wallet.data
+peers.json
+*.xsnp
+
+# xdagj exporter build output
+/tools/xdagj-exporter/out/

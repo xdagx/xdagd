@@ -1,0 +1,187 @@
+# 重写过程中在 xdagj 中发现的问题
+
+基于 xdagj 0.8.4（master `3d8f8271`）源码。每一项给出位置、影响和本实现的处理方式。
+
+处理方式分三类：
+
+- **已修复**：不影响共识结果的问题，两种规则下都直接修复。
+- **Nova 修复**：修复会改变共识结果（同一组区块会得出不同的账本），只能在 Nova 分叉激活后生效；
+  激活前为了与现网历史一致，旧规则区块照原样处理（测试中明确记录了旧行为）。
+- **不适用**：新架构下该问题不存在。
+
+## 一、共识与账本（严重）
+
+### C1. 非候选块按 sha256d 计算难度：可抢主块、可大范围回滚 — **严重，Nova 修复**
+
+- 位置：`BlockchainImpl.calculateCurrentBlockDiff`
+- RandomX 分叉后，只有"epoch 末尾"的区块按 RandomX 计算难度，**其他所有无输入区块仍按 sha256d 哈希计算难度**。
+  SHA256 可以用 GPU/ASIC 极快地研磨，于是：
+  1. 研磨一个 epoch 中途的链接块，它的难度可以轻易超过本 epoch 所有 RandomX 候选块，从而成为主块、拿走奖励；
+  2. 研磨一个不与主链相连、或从较早主块分叉的区块，它的累计难度可以超过主链很长一段历史，节点随即回滚这段主链（`unWindMain`）。
+- 这类攻击此前只是被**节点白名单**挡住了：只有白名单节点能广播区块。去掉白名单后，任何人都可以实施。
+- 处理：Nova 规则下只有 epoch 末尾、带挖矿 nonce 的候选块有自身难度，其他区块自身难度为 0；
+  非候选块另需满足 `min_link_pow_bits` 位的反垃圾工作量。
+- 测试：`legacy_rules_let_a_ground_link_block_take_the_main_block`、`nova_rules_ignore_hash_grinding_of_non_candidates`、
+  `legacy_rules_let_a_disconnected_ground_block_unwind_the_whole_chain`、`nova_rules_ignore_a_disconnected_ground_block`。
+
+> 这是去掉白名单之前**必须**先激活 Nova 的原因，见 [MIGRATION.md](MIGRATION.md)。
+
+### C2. 同一来源区块的重复 IN：区块余额变负，凭空增发 — **严重，Nova 修复**
+
+- 位置：`BlockchainImpl.applyBlock`
+- 主交易的每个 IN 链接单独与来源区块的**原始**余额比较，然后逐个扣减。同一个来源区块写两次 IN，
+  每次都通过检查，扣减后余额为负，输出方多拿到的钱是凭空产生的。任何拥有区块余额的人（即挖到过主块的人）都可以利用。
+- 处理：Nova 规则下按来源区块汇总后再检查余额。
+- 测试：`legacy_rules_allow_the_duplicate_in_double_spend`（记录旧行为）、`duplicate_in_links_cannot_double_spend_a_block_balance`。
+
+### C3. 同步时采用对端给出的交易执行结果 — **严重，已修复**
+
+- 位置：`applyBlock` 中 `syncTxStatusCache` 分支（`SYNC_BLOCK` 消息携带的执行状态）
+- 同步中的节点直接采用对端声称的"这笔交易成功/失败"，恶意节点可以让新节点得出不同的账本。
+- 处理：`SYNC_BLOCK` 携带的状态被忽略，所有交易都在本地执行。
+
+### C4. 金额溢出使 `setMain` 执行到一半中止 — **高，Nova 修复**
+
+- 位置：`applyBlock`（`XAmount.add` 抛 `ArithmeticException`）
+- 某个交易的金额相加溢出时异常向上抛出，主块已经加了奖励、增加了 `nmain`，但区块没有执行完，状态停在中间。
+- 处理：旧规则下复现"中止"语义，但通过撤销日志把该主块的全部改动精确回退（不留下半截状态）；
+  Nova 规则下导入时就检查输入 / 输出总和不溢出，这类区块直接无效。
+
+### C5. 余额不足的交易消耗 nonce 却不付手续费 — **中，Nova 修复**
+
+- 位置：`applyBlock`（账户交易余额不足分支）
+- 余额不足的交易被拒绝但 nonce 被消耗，且不收取任何手续费；提交时也不检查余额。攻击者可以零成本地制造大量需要全网执行的交易。
+- 处理：Nova 规则下"失败扣费"——余额够付手续费就扣手续费；交易池在接收时检查余额与 nonce。
+- 测试：`insufficient_balance_consumes_nonce_without_transfer`（旧行为）、`failed_transfer_pays_fee_and_consumes_nonce`、
+  `legacy_tx_blocks_still_work_and_pay_fee_on_failure`。
+
+### C6. 区块有效性依赖当前状态，导入顺序影响结果 — **中，已处理 / Nova 修复**
+
+- 位置：`tryToConnect`（`INPUT` 地址必须已存在）
+- 给一个新地址转账的交易还没执行时，从这个地址转出的交易会被判为无效并丢弃；
+  不同节点收到区块的顺序不同，结果就可能不同。
+- 处理：两种规则下都改为"暂缓，下一个主块确认后重试"；Nova 规则下取消这条检查。
+- 测试：`import_order_does_not_change_the_result`。
+
+### C7. 回滚时手续费统计漂移 — **低，已修复**
+
+- 位置：`applyBlock` 用 `getTxFee` 累加 `allBalance`，`unApplyBlock` 用 `block.getFee()` 扣回
+- 两者不一致，经历回滚后全网余额统计会偏移。
+- 处理：每个主块的执行都有撤销日志，回滚后状态与"从未执行"逐字节相同。测试：`reorg_undoes_and_redoes_state_exactly`。
+
+### C8. `setMain` / 回滚的写入不是原子的 — **中，已修复**
+
+- 位置：`setMain`、`unSetMain`（多次独立的 RocksDB 写入）
+- 进程在中途退出会留下部分更新（奖励已加、区块未执行等）。
+- 处理：一个主块的所有改动在同一个存储事务中提交。
+
+### C9. RandomX 分叉时间回滚后被设为 -1 — **低，已修复**
+
+- 位置：`RandomX.randomXUnsetForkTime`
+- 回滚越过分叉高度时分叉时间被设为 -1，此后**所有** epoch 都被当作已分叉。
+- 处理：回滚到"未分叉"。
+
+## 二、存储与历史（用户要求修复的问题）
+
+### S1. 每次升级都要清库，交易历史丢失 — **根本原因，已修复**
+
+xdagj 的历史丢失由三件事共同造成：
+
+1. **Kryo 按 Java 类结构序列化**：`BlockInfo` 等记录的二进制格式由类的字段决定，类一改，旧数据就读不出来（或读成错的），
+   只能清库；
+2. 清库后只能**从余额快照重建**：快照只有余额和少量区块，历史区块和交易都没有了；
+3. **交易历史存放在外部 MySQL**，在收到区块时写入，而不是在执行时写入（见 S2）。
+
+处理：
+
+- 所有记录使用显式、带版本号的二进制编码，与任何语言的对象布局无关；
+- 数据库带 schema 版本号，升级时按顺序执行迁移；遇到更新版本的数据库拒绝打开，不会误读；
+- 节点从不删除区块、历史；
+- 迁移时，xdagj 节点上的全部原始区块可以导入归档（`archive import-raw`），旧 C 版 xdag 的 `storage/*.dat` 也可以导入，
+  历史可以一直查到创世。
+
+### S2. 交易历史在收到区块时写入，回滚不撤销 — **已修复**
+
+- 位置：`tryToConnect` 中写入 `TxHistory`
+- 被拒绝的交易、后来被回滚的交易都会留在历史里，历史与账本不一致。
+- 处理：历史在主块执行时写入，带状态（成功 / 拒绝 / 失败但扣费），并记录在撤销日志中，回滚时一并撤销。
+  测试：`payout_and_account_transfer`、`history_records_the_credited_amount`。
+
+## 三、金额精度
+
+### A1. 金额经 `double` 换算 — **低，已修复（旧规则下逐位复现）**
+
+- 位置：`XAmount.toXAmount`（`BasicUtils.xdag2amount(double)`）等
+- nano 与 C 单位之间的换算经过 `double`，存在舍入误差。
+- 处理：共识相关的旧规则换算逐位复现（否则无法与现网一致）；其余部分和 Nova 规则下全部使用整数精确运算。
+
+### A2. RPC / 命令行的转账金额被四舍五入到 0.01 XDAG — **已修复**
+
+- 位置：`BasicUtils.getDouble`（`setScale(2, HALF_UP)`），被 `xdag_personal_sendTransaction` 系列和命令行 `xfer` 调用
+- 处理：十进制精确解析，最多 9 位小数。
+
+## 四、网络
+
+### N1. 节点白名单 — **按需求移除**
+
+- 入站只接受 `whiteIPs` 中的地址（为空时拒绝所有入站），出站只连配置中的节点，没有节点发现。
+- 处理：开放网络 + 节点交换 + 连接上限 / 限流 / 打分 / 封禁（见 DESIGN.md 第 6 节）。
+
+### N2. `BLOCKS_REQUEST` 时间范围没有上限 — **高（拒绝服务），已修复**
+
+- 位置：`XdagP2pHandler` 处理 `BLOCKS_REQUEST`
+- 对端可以请求一个极大的时间范围，节点按 epoch 逐个遍历（可达 2^32 次以上）。
+- 处理：时间跨度 ≤ 2^20，单次回复 ≤ 5 万个区块，并有速率限制。
+
+### N3. 相信对端报告的链统计 — **中，已修复**
+
+- 位置：`XdagStats.update`
+- 取所有对端声称的最大区块数 / 主块数，一个谎报的对端就能让节点永远认为"还没同步完"（不出块、不挖矿）。
+- 处理：对端统计只用于选择同步对象；是否同步完成由本地链的时间判断。
+
+### N4. 分片边界错误 — **低，已修复**
+
+- 位置：`XdagMessageHandler`（最后一个分片长度按 `length % limit` 计算）
+- 压缩后的消息长度恰为分片大小的整数倍时，最后一个分片的长度被算成 0，消息被截断，对端无法解码。
+- 处理：修正分片计算。
+
+### N5. 不检查自连接与重复连接 — **低，已修复**
+
+## 五、并发
+
+### P1. 额外块池（`memOrphanPool`）无锁访问 — **中，不适用**
+
+- 位置：`BlockchainImpl`，RPC 线程与导入线程同时访问 `LinkedHashMap`
+- 处理：链状态由唯一所有者持有（互斥锁），RPC 读取的是存储的 MVCC 快照。
+
+### P2. `ImportResult` 枚举携带可变字段 — **中，不适用**
+
+- 位置：`ImportResult`（枚举单例上的 `hashlow`、`errorInfo` 字段被并发改写）
+- 并发导入时错误信息 / 区块哈希会串到别的请求上。处理：导入结果是普通值类型。
+
+### P3. 历史分页使用全局静态变量 `totalPage` — **低，已修复**
+
+- 位置：`TransactionHistoryStoreImpl.totalPage`（`public static`），RPC 返回后再重置为 1
+- 并发的分页查询会拿到别人的总页数。
+
+## 六、其他
+
+| 编号 | 位置 | 问题 | 处理 |
+|---|---|---|---|
+| O1 | `doXfer` | 从多个钱包账户凑钱转账时，所有账户共用第一个账户的 nonce；各账户 nonce 不同时转账失败，并提示"传入的 nonce 不正确"（用户根本没有传） | 转账只从一个账户（指定的 `from` 或默认账户）支出，使用该账户自己的 nonce |
+| O2 | 矿池奖励 | 独立挖矿（没有外部矿池）时，矿池份额永远留在主块余额里 | 16 个 epoch 后转入节点账户 |
+| O3 | `BasicUtils.getDiffByHash`（共识难度计算） | 哈希前 96 位全为零时除零抛异常（理论问题，需约 2^96 次哈希） | 该情况下取最大难度 |
+| O4 | `updateBlockFlag` | 手续费非零时静默地从数据库重新读取手续费，依赖调用顺序 | 执行状态与 DAG 元数据分离，不存在此问题 |
+| O5 | `checkMineAndAdd` | 对没有输出签名的区块直接解引用（空指针） | 导入时要求输出签名 |
+
+## 七、本实现与 xdagj 行为不同之处（汇总）
+
+以下差异是有意为之，列出以便核对：
+
+1. 旧规则下主块执行因溢出中止时，本实现精确撤销该主块的全部改动；xdagj 会留下部分状态（C4）。
+2. 同步时不采用对端给出的执行状态（C3）。
+3. `INPUT` 地址不存在的交易被暂缓重试，而不是丢弃（C6）。
+4. `xdag_personal_sendTransaction`：发送方另付手续费，接收方收到全额（xdagj 从转账金额中扣除手续费）；
+   不指定 `from` 时从默认账户支出，而不是像 xdagj 那样跨多个账户凑钱（O1）。
+5. `rollTx` 中清除 `BI_REF` 标志的行为未复制（该行为只影响本地的孤块池，不影响账本）。
+6. 回滚跨过 RandomX 分叉高度时恢复为"未分叉"（C9）。

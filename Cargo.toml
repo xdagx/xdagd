@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/storage",
+    "crates/chain",
+    "crates/evm",
+    "crates/randomx",
+    "crates/wallet",
+    "crates/net",
+    "crates/rpc",
+    "crates/pool",
+    "crates/node",
+]
+
+[workspace.package]
+version = "1.0.0-alpha.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/XDagger/xdag-rs"
+rust-version = "1.91"
+
+[workspace.dependencies]
+xdag-types = { path = "crates/types" }
+xdag-storage = { path = "crates/storage" }
+xdag-randomx = { path = "crates/randomx" }
+xdag-evm = { path = "crates/evm" }
+xdag-chain = { path = "crates/chain" }
+xdag-wallet = { path = "crates/wallet" }
+xdag-net = { path = "crates/net" }
+xdag-rpc = { path = "crates/rpc" }
+xdag-pool = { path = "crates/pool" }
+
+anyhow = "1"
+thiserror = "2"
+hex = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+ripemd = "0.1"
+sha3 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+secp256k1 = { version = "0.30", features = ["recovery", "global-context", "rand"] }
+rand = "0.8"
+ruint = { version = "1.12", default-features = false, features = ["std"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rayon = "1.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+snap = "1"
+redb = "2"
+lru = "0.12"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["ws"] }
+tempfile = "3"
+bcrypt = "0.16"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+bip39 = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 1
+
+[profile.dev]
+# keep debug builds usable for consensus-heavy tests
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"

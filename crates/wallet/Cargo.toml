@@ -1,0 +1,26 @@
+[package]
+name = "xdag-wallet"
+description = "XDAG wallet: xdagj wallet.data (v4) compatibility, BIP39/BIP44 (m/44'/586'/...)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xdag-types.workspace = true
+thiserror.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+secp256k1.workspace = true
+rand.workspace = true
+bcrypt.workspace = true
+aes.workspace = true
+cbc.workspace = true
+bip39.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

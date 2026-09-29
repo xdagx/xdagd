@@ -1,0 +1,41 @@
+[package]
+name = "xdag-node"
+description = "XDAG full node (xdagd)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xdagd"
+path = "src/main.rs"
+
+[dependencies]
+xdag-types.workspace = true
+xdag-storage.workspace = true
+xdag-chain.workspace = true
+xdag-evm.workspace = true
+xdag-randomx.workspace = true
+xdag-wallet.workspace = true
+xdag-net.workspace = true
+xdag-rpc.workspace = true
+xdag-pool.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

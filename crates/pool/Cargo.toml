@@ -1,0 +1,23 @@
+[package]
+name = "xdag-pool"
+description = "XDAG mining coordination: xdagj-pool compatible WebSocket tasks/shares, built-in miner, reward distribution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xdag-types.workspace = true
+xdag-chain.workspace = true
+axum.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true
