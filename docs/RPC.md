@@ -25,15 +25,15 @@ curl -s -H 'content-type: application/json' \
 | `xdag_coinbase` | — | 节点地址 |
 | `xdag_getBalance` | 地址或区块 | 账户余额或区块余额 |
 | `xdag_getTotalBalance` | — | 节点自身账户的余额 |
-| `xdag_getTransactionNonce` | 地址 | 下一个可用 nonce（包含交易池中待执行的交易） |
+| `xdag_getTransactionNonce` | 地址 | 下一个可以执行的 nonce：已执行数 + 1，再跳过已经在途、且与之连续的交易（跳号之后的交易不算，它们永远不会执行） |
 | `xdag_getRewardByNumber` | 高度 | 该高度主块奖励 |
 | `xdag_getBalanceByNumber` | 高度 | 该高度主块的区块余额 |
 | `xdag_getStatus` | — | 区块数、主块数、难度、供应量、是否同步完成、额外块数、交易池大小（算力字段固定为 `"0.0"`） |
-| `xdag_getBlockByHash` / `xdag_getTransactionByHash` | 区块或地址, [页码, 每页条数] 或 [页码, 起始毫秒, 结束毫秒, [每页条数]] | 区块详情（引用、交易列表、分页）；参数为地址时返回账户信息与交易历史。每页默认 100、最多 500 条；此接口的分页最多覆盖最近 10 万条记录，更早的记录用 `xdag_getHistory` |
+| `xdag_getBlockByHash` / `xdag_getTransactionByHash` | 区块或地址, [页码, 每页条数] 或 [页码, 起始毫秒, 结束毫秒, [每页条数]] | 区块详情（引用、交易列表、分页）；参数为地址时返回账户信息与交易历史。每页默认 100、最多 500 条；此接口的分页最多覆盖最近 10 万条记录，更早的记录用 `xdag_getHistory`。也能查到还只在内存中的主块候选（与 xdagj 相同）。从快照继承的区块（没有原始数据）`type` 为 `Snapshot`；xdagj 对这类区块只返回余额（高度为 0、状态为空、时间是快照时间），xdagd 返回记录下来的高度、时间、状态、难度和备注 |
 | `xdag_getBlockByNumber` | 高度, 分页参数同上 | 主块详情 |
-| `xdag_getBlocksByNumber` | 数量（≤1000） | 最近的主块列表（简要） |
+| `xdag_getBlocksByNumber` | 数量（≤1000） | 最近的主块列表（简要）。与 xdagj 一样，列表里从快照继承的主块 `type` 是 `Main` |
 | `xdag_sendRawTransaction` | 512 字节区块的十六进制 | 提交旧式交易块。与 xdagj 相同，返回字符串：成功为区块地址，失败为 `INVALID_BLOCK <原因>` |
-| `xdag_personal_sendTransaction` / `xdag_personal_sendSafeTransaction` | `{"to","value","remark"?,"from"?}`, 钱包密码 | 从节点钱包转账（需要节点加载钱包）。`value` 精确解析；发送方另付手续费，接收方收到 `value` 全额 |
+| `xdag_personal_sendTransaction` / `xdag_personal_sendSafeTransaction` | `{"to","value","remark"?,"from"?}`, 钱包密码 | 从节点钱包转账（需要节点加载钱包）。`value` 精确解析；发送方另付手续费，接收方收到 `value` 全额。与 xdagj 一样，结果总是放在 `result` 对象里：`{code, result, resInfo, errMsg}`，`code` 为 0 表示成功，失败时使用 xdagj 的代码（-10000 地址格式、-10001 缺少收款地址、-10201 余额不足、-10301 钱包密码错误、-10500 参数错误） |
 | `xdag_syncing` | — | `{currentBlock, highestBlock, isSyncDone}` |
 | `xdag_netConnectionList` | — | 连接列表（另含 `nova`、`score` 字段） |
 | `xdag_getAverageFee` | — | 最低手续费 |
@@ -42,7 +42,7 @@ curl -s -H 'content-type: application/json' \
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
-| `xdag_getChainInfo` | — | `network`、`novaActivationEpoch`、`chainId`、`epochSeconds`、`minGas`、`minNativeFee`、`minGasPrice`、`client` |
+| `xdag_getChainInfo` | — | `network`、`novaActivationEpoch`、`chainId`、`epochSeconds`、`minGas`、`minNativeFee`、`minGasPrice`、`client`，以及 `randomx`：`forkHeight`、`forkEpoch`、`seeds`（每个种子的 `height`、`switchEpoch`、`key`） |
 | `xdag_getHistory` | 地址或区块, [cursor], [limit 1–1000，默认 100] | 执行时记录的历史，新的在前。每条：`direction`（0 转出、1 转入、2 奖励/手续费收入、3 失败交易支付的手续费）、`hashlow`、`address`、`counterparty`、`amount`、`time`（毫秒）、`remark`、`height`、`status`（`applied` / `rejected` / `failed`）、`cursor`。翻页时把上一页最后一条的 `cursor`（形如 `"高度.序号"`）作为参数传入；传整数高度表示从该主块之前开始 |
 | `xdag_sendNovaTransaction` | 原生转账编码的十六进制（格式见 DESIGN.md 3.3） | 交易哈希 |
 | `xdag_getNovaTransaction` | 交易哈希（原生转账或 EVM 交易） | `{block, index, height, status, sender, fee, gasUsed}`；未执行时为 `null` |

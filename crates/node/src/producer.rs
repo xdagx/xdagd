@@ -53,7 +53,8 @@ pub fn run(node: Arc<Node>, coord: Arc<Coordinator>) {
     let mut last_tick = Instant::now();
     let mut last_batch = Instant::now();
     let mut last_link = Instant::now();
-    let mut rewards = RewardManager::default();
+    let rewards_file = node.cfg.datadir.join("rewards.json");
+    let mut rewards = RewardManager::load(&rewards_file);
     let policy = reward_policy(&node);
     let batch_interval = Duration::from_millis(node.cfg.mining.batch_interval_ms.max(100));
     loop {
@@ -86,6 +87,9 @@ pub fn run(node: Arc<Node>, coord: Arc<Coordinator>) {
                 }
             }
             pay_rewards(&node, &policy, &mut rewards, epoch);
+            if let Err(e) = rewards.save(&rewards_file) {
+                tracing::warn!("cannot save pending rewards: {e}");
+            }
             cur_pretop = new_task(&node, &coord, epoch);
             cur_epoch = Some(epoch);
         } else {

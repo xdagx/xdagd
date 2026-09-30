@@ -629,10 +629,8 @@ impl Chain {
         }
 
         // --- mutation ------------------------------------------------------
+        // (xdagj defines a REMARK flag but never sets it; neither do we)
         let mut dflags = if is_extra { flags::EXTRA } else { 0 };
-        if block.remark.is_some() {
-            dflags |= flags::REMARK;
-        }
         let action = if is_extra { RemoveAction::Extra } else { RemoveAction::Normal };
         let refs: Vec<HashLow> = block.block_links().collect();
         for r in refs {

@@ -1,9 +1,9 @@
 //! The node: owns the chain, transaction pool, keys and the import pipeline,
 //! and connects them to the P2P, RPC and mining components.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -60,14 +60,17 @@ pub struct Node {
     #[allow(dead_code)]
     pub pow: Arc<dyn PowEngine>,
     pub rx_engine: Option<Arc<xdag_randomx::RandomXEngine>>,
-    pub net: OnceLock<NetHandle>,
+    /// The network, while the node runs. It refers back to the node, so it is
+    /// taken out again at shutdown (see `main::run`).
+    pub net: parking_lot::RwLock<Option<NetHandle>>,
     import_tx: Sender<ImportJob>,
     import_rx: Receiver<ImportJob>,
     waiters: Mutex<Waiters>,
     pub started: Instant,
     pub shutdown: AtomicBool,
     /// highest nonce of legacy account transactions not yet executed, per sender
-    pending_legacy: Mutex<HashMap<Address, u64>>,
+    /// Nonces of legacy account transactions that are in the DAG but not executed yet.
+    pending_legacy: Mutex<HashMap<Address, BTreeSet<u64>>>,
 }
 
 impl Node {
@@ -95,7 +98,7 @@ impl Node {
             evm,
             pow,
             rx_engine,
-            net: OnceLock::new(),
+            net: parking_lot::RwLock::new(None),
             import_tx: tx,
             import_rx: rx,
             waiters: Mutex::new(Waiters::default()),
@@ -105,8 +108,8 @@ impl Node {
         })
     }
 
-    pub fn net(&self) -> Option<&NetHandle> {
-        self.net.get()
+    pub fn net(&self) -> Option<NetHandle> {
+        self.net.read().clone()
     }
 
     // ------------------------------------------------------------------
@@ -213,10 +216,14 @@ impl Node {
                 match &out {
                     ImportOutcome::ImportedBest | ImportOutcome::ImportedNotBest => {
                         if let Some((a, _)) = block.account_input() {
-                            let n = block.tx_nonce.unwrap_or(0);
                             let mut pl = self.pending_legacy.lock();
-                            let e = pl.entry(a).or_insert(0);
-                            *e = (*e).max(n);
+                            if pl.len() > 100_000 {
+                                pl.clear(); // only a hint for wallets: never let it grow without bound
+                            }
+                            let set = pl.entry(a).or_default();
+                            if set.len() < 4096 {
+                                set.insert(block.tx_nonce.unwrap_or(0));
+                            }
                         }
                         let ttl = if job.local { self.cfg_ttl() } else { job.ttl };
                         if ttl > 0 {
@@ -260,7 +267,7 @@ impl Node {
             events = chain.take_events();
         }
 
-        let net = self.net.get().cloned();
+        let net = self.net();
         if let Some(net) = &net {
             for (raw, payload, ttl, from) in relay {
                 net.broadcast_block(&raw, payload.as_deref(), ttl, from);
@@ -315,8 +322,11 @@ impl Node {
                         done.push(<[u8; 32]>::try_from(tx.as_slice()).unwrap());
                     } else if let Some(a) = sender {
                         let mut pl = self.pending_legacy.lock();
-                        if pl.get(&a).map(|p| *p <= nonce).unwrap_or(false) {
-                            pl.remove(&a);
+                        if let Some(set) = pl.get_mut(&a) {
+                            set.retain(|p| *p > nonce);
+                            if set.is_empty() {
+                                pl.remove(&a);
+                            }
                         }
                     }
                 }
@@ -339,10 +349,12 @@ impl Node {
     // ------------------------------------------------------------------
 
     pub fn is_synced(&self) -> bool {
+        // the top is usually the newest candidate, which lives only in memory
         let (top_time, nmain) = {
-            let meta = query::chain_meta(&self.db).unwrap_or_default();
-            let t = meta.top.and_then(|t| query::block_view(&self.db, &t).ok().flatten()).map(|v| v.info.time);
-            (t, meta.nmain)
+            let mut chain = self.chain.lock();
+            let top = chain.top();
+            let t = top.and_then(|t| chain.info(&t).ok().flatten()).map(|i| i.time);
+            (t, chain.nmain())
         };
         let ep = self.params.epochs();
         let now = xdag_types::time::now_xdag();
@@ -365,7 +377,7 @@ impl Node {
             top: meta.top,
             top_diff: meta.top_diff,
             synced: self.is_synced(),
-            extra: 0,
+            extra: self.chain.lock().extra_count(),
             pool_txs: self.txpool.lock().len(),
             now: xdag_types::time::now_xdag(),
         }
@@ -397,8 +409,7 @@ impl Node {
         if evm {
             pool.map(|n| n + 1).unwrap_or(executed).max(executed)
         } else {
-            let legacy = self.pending_legacy.lock().get(a).copied().unwrap_or(0);
-            executed.max(legacy).max(pool.unwrap_or(0)) + 1
+            next_legacy_nonce(executed.max(pool.unwrap_or(0)), self.pending_legacy.lock().get(a))
         }
     }
 
@@ -465,6 +476,18 @@ impl Node {
             min_gas_price: 0,
         }
     }
+}
+
+/// The next nonce that can execute: pending transactions count only while
+/// they continue the sequence (one beyond a gap never runs, as on xdagj).
+fn next_legacy_nonce(executed: u64, pending: Option<&BTreeSet<u64>>) -> u64 {
+    let mut next = executed + 1;
+    if let Some(set) = pending {
+        while set.contains(&next) {
+            next += 1;
+        }
+    }
+    next
 }
 
 fn reply(job: &ImportJob, out: ImportOutcome) {
@@ -586,6 +609,16 @@ impl xdag_rpc::Backend for RpcBridge {
     fn params(&self) -> &NetworkParams {
         &self.0.params
     }
+    fn block_view(&self, h: &HashLow) -> Result<Option<query::BlockView>, String> {
+        if let Some(v) = query::block_view(&self.0.db, h).map_err(|e| e.to_string())? {
+            return Ok(Some(v));
+        }
+        // a main-block candidate that is not referenced yet lives only in memory
+        let mut chain = self.0.chain.lock();
+        let Some((block, payload)) = chain.extra_block(h) else { return Ok(None) };
+        let Some(info) = chain.info(h).map_err(|e| e.to_string())? else { return Ok(None) };
+        Ok(Some(query::BlockView { hashlow: *h, info, state: Default::default(), block: Some((*block).clone()), payload }))
+    }
     fn db(&self) -> &Db {
         &self.0.db
     }
@@ -600,6 +633,8 @@ impl xdag_rpc::Backend for RpcBridge {
         match self.0.import_local(raw, None) {
             o if o.is_imported() => Ok(b.hashlow()),
             ImportOutcome::Exist | ImportOutcome::InMem => Ok(b.hashlow()),
+            ImportOutcome::Invalid(m) | ImportOutcome::Deferred(m) | ImportOutcome::Error(m) => Err(m),
+            ImportOutcome::NoParent(h) => Err(format!("a block it refers to is unknown: {}", h.to_legacy_address())),
             o => Err(format!("{o:?}")),
         }
     }
@@ -630,5 +665,19 @@ impl xdag_rpc::Backend for RpcBridge {
     }
     fn client_version(&self) -> String {
         format!("xdag-rs/v{}/{}-{}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_nonce_stops_at_a_gap() {
+        assert_eq!(next_legacy_nonce(2, None), 3);
+        let pending: BTreeSet<u64> = [3, 4, 9].into_iter().collect();
+        assert_eq!(next_legacy_nonce(2, Some(&pending)), 5, "3 and 4 are on their way; 9 sits beyond a gap");
+        let stale: BTreeSet<u64> = [1, 2].into_iter().collect();
+        assert_eq!(next_legacy_nonce(2, Some(&stale)), 3);
     }
 }

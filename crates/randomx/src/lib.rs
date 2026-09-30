@@ -128,27 +128,36 @@ impl Drop for Hasher {
 
 /// [`PowEngine`] backed by RandomX, keeping hashers for recent keys.
 pub struct RandomXEngine {
-    hashers: Mutex<VecDeque<Arc<Mutex<Hasher>>>>,
+    hashers: Mutex<VecDeque<([u8; 32], Arc<Mutex<Hasher>>)>>,
     capacity: usize,
     full_mem: bool,
 }
 
 impl RandomXEngine {
+    /// Keeps the hashers of two seeds: around a seed change blocks of the old
+    /// and of the new seed arrive side by side.
     pub fn new(full_mem: bool) -> Self {
-        RandomXEngine { hashers: Mutex::new(VecDeque::new()), capacity: 2, full_mem }
+        Self::with_capacity(full_mem, 2)
+    }
+
+    /// Each cached seed costs 256 MiB (2 GiB in fast mode). With one seed a
+    /// node still works, but re-initialises whenever the seed in use changes.
+    pub fn with_capacity(full_mem: bool, seeds: usize) -> Self {
+        RandomXEngine { hashers: Mutex::new(VecDeque::new()), capacity: seeds.max(1), full_mem }
     }
 
     fn hasher(&self, key: &[u8; 32]) -> Option<Arc<Mutex<Hasher>>> {
         let mut hs = self.hashers.lock();
-        if let Some(h) = hs.iter().find(|h| h.lock().key() == key) {
+        if let Some((_, h)) = hs.iter().find(|(k, _)| k == key) {
             return Some(h.clone());
+        }
+        // make room before allocating the next cache
+        while hs.len() >= self.capacity {
+            hs.pop_front();
         }
         tracing::info!(key = %hex_key(key), full_mem = self.full_mem, "initialising RandomX for new seed");
         let h = Arc::new(Mutex::new(Hasher::new(key, self.full_mem)?));
-        hs.push_back(h.clone());
-        while hs.len() > self.capacity {
-            hs.pop_front();
-        }
+        hs.push_back((*key, h.clone()));
         Some(h)
     }
 

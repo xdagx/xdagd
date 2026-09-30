@@ -123,6 +123,27 @@ enum TxCmd {
         #[arg(long, default_value_t = 1_000_000)]
         gas: u64,
     },
+    /// Account transaction in xdagj's block format (networks still on xdagj's rules).
+    Legacy {
+        to: String,
+        amount: String,
+        /// Transaction nonce (default: asked from the node).
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value = "")]
+        remark: String,
+    },
+    /// Spend the balance of a block signed by this key (a mined block's
+    /// reward, or a balance from before account addresses existed), in xdagj's
+    /// block format. The receiver gets the amount less the 0.1 XDAG fee.
+    FromBlock {
+        /// Address of the block that holds the balance.
+        block: String,
+        to: String,
+        amount: String,
+        #[arg(long, default_value = "")]
+        remark: String,
+    },
     /// Print the address(es) of the key.
     Address,
 }
@@ -147,6 +168,19 @@ enum SnapshotCmd {
     Import { file: PathBuf },
     /// Describe a snapshot file without importing it.
     Info { file: PathBuf },
+    /// Compare the consensus state in two snapshots taken at the same main
+    /// height (e.g. an xdagj export and the export of an xdagd node that
+    /// followed the same chain).
+    Diff { first: PathBuf, second: PathBuf },
+    /// Audit a snapshot file offline: recompute block hashes, signatures,
+    /// difficulties (including RandomX) and the main chain from the file itself
+    /// and compare the balances with the rewards issued.
+    Verify {
+        file: PathBuf,
+        /// Hash at most this many main-block candidates with RandomX (the newest).
+        #[arg(long)]
+        randomx_limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -229,14 +263,18 @@ fn load_node_key(cfg: &NodeConfig) -> Result<(KeyPair, Option<xdag_wallet::Walle
 
 fn open_db(cfg: &NodeConfig) -> Result<Db> {
     std::fs::create_dir_all(&cfg.datadir)?;
-    Db::open(&cfg.db_path(), &[]).map_err(|e| anyhow!("open database: {e}"))
+    Db::open_with_cache(&cfg.db_path(), &[], cfg.db_cache_mb.max(1) << 20).map_err(|e| anyhow!("open database: {e}"))
 }
 
 fn build_node(cfg: NodeConfig) -> Result<Arc<Node>> {
     let params = cfg.params()?;
     let db = open_db(&cfg)?;
     let (key, wallet) = load_node_key(&cfg)?;
-    let rx_engine = if cfg.randomx.disabled { None } else { Some(Arc::new(xdag_randomx::RandomXEngine::new(cfg.randomx.full_mem))) };
+    let rx_engine = if cfg.randomx.disabled {
+        None
+    } else {
+        Some(Arc::new(xdag_randomx::RandomXEngine::with_capacity(cfg.randomx.full_mem, cfg.randomx.cache_seeds.unwrap_or(2))))
+    };
     let pow: Arc<dyn PowEngine> = match &rx_engine {
         Some(e) => e.clone(),
         None => Arc::new(NoRandomX),
@@ -262,10 +300,10 @@ async fn run(cfg: NodeConfig) -> Result<()> {
         "starting xdagd {}",
         env!("CARGO_PKG_VERSION")
     );
-    {
+    let import = {
         let n = node.clone();
-        std::thread::Builder::new().name("import".into()).spawn(move || n.import_loop())?;
-    }
+        std::thread::Builder::new().name("import".into()).spawn(move || n.import_loop())?
+    };
     let net_cfg = xdag_net::NetConfig {
         network: params.network.id(),
         network_version: params.network_version as i16,
@@ -284,7 +322,7 @@ async fn run(cfg: NodeConfig) -> Result<()> {
         ..xdag_net::NetConfig::default()
     };
     let net = xdag_net::start(net_cfg, xdag_net::Identity::new(node.key.clone()), Arc::new(NetBridge(node.clone()))).await?;
-    let _ = node.net.set(net.clone());
+    *node.net.write() = Some(net.clone());
 
     if cfg.rpc.enabled {
         let b: Arc<dyn xdag_rpc::Backend> = Arc::new(RpcBridge(node.clone()));
@@ -316,19 +354,43 @@ async fn run(cfg: NodeConfig) -> Result<()> {
     } else {
         None
     };
-    {
+    let producer = {
         let (n, c) = (node.clone(), coord.clone());
-        std::thread::Builder::new().name("producer".into()).spawn(move || producer::run(n, c))?;
-    }
+        std::thread::Builder::new().name("producer".into()).spawn(move || producer::run(n, c))?
+    };
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     tracing::info!("shutting down");
     node.shutdown.store(true, Ordering::SeqCst);
     net.shutdown();
     if let Some(m) = miner {
         m.stop();
     }
+    // the worker threads finish what they are writing and let go of the database
+    for worker in [import, producer] {
+        let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+    }
     node.chain.lock().commit(true).map_err(|e| anyhow!("final commit: {e}"))?;
+    // node and network refer to each other: part them, or neither is ever
+    // dropped and the database is not closed
+    node.net.write().take();
+    Ok(())
+}
+
+/// Ctrl-C, or the SIGTERM a service manager stops a service with. Dying on
+/// it instead would skip the final commit and leave the database to be
+/// repaired on the next start.
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r?,
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
@@ -381,13 +443,26 @@ fn wallet_cmd(cfg: &NodeConfig, cmd: WalletCmd) -> Result<()> {
 }
 
 fn snapshot_cmd(cfg: &NodeConfig, cmd: SnapshotCmd) -> Result<()> {
-    if let SnapshotCmd::Info { file } = &cmd {
-        return snapshot_info(file);
+    match &cmd {
+        SnapshotCmd::Info { file } => return snapshot_info(file),
+        SnapshotCmd::Diff { first, second } => {
+            let open = |p: &PathBuf| {
+                let f = std::fs::File::open(p).map_err(|e| xdag_chain::ChainError::Other(format!("opening {}: {e}", p.display())))?;
+                Ok(std::io::BufReader::with_capacity(1 << 20, f))
+            };
+            let d = xdag_chain::snapshot::diff(|| open(first), open(second).map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!("{e}"))?;
+            d.lines.iter().for_each(|l| println!("{l}"));
+            anyhow::ensure!(d.state_differences == 0, "{} differences in consensus state", d.state_differences);
+            println!("the consensus state of the blocks and accounts both snapshots contain is identical");
+            return Ok(());
+        }
+        SnapshotCmd::Verify { file, randomx_limit } => return snapshot_verify(cfg, file, *randomx_limit),
+        _ => {}
     }
     let node = build_node(cfg.clone())?;
     let mut chain = node.chain.lock();
     match cmd {
-        SnapshotCmd::Info { .. } => unreachable!("handled above"),
+        SnapshotCmd::Info { .. } | SnapshotCmd::Diff { .. } | SnapshotCmd::Verify { .. } => unreachable!("handled above"),
         SnapshotCmd::Export { file } => {
             let f = std::io::BufWriter::new(std::fs::File::create(&file)?);
             xdag_chain::snapshot::export(&mut chain, f).map_err(|e| anyhow!("{e}"))?;
@@ -427,6 +502,29 @@ fn snapshot_info(file: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Audit a snapshot under its own network's rules (the configuration's, if it
+/// is for that network: a development network may override them).
+fn snapshot_verify(cfg: &NodeConfig, file: &Path, randomx_limit: Option<usize>) -> Result<()> {
+    let open = || {
+        let f = std::fs::File::open(file).map_err(|e| xdag_chain::ChainError::Other(format!("opening {}: {e}", file.display())))?;
+        Ok(std::io::BufReader::with_capacity(1 << 20, f))
+    };
+    let (_, header) = xdag_chain::snapshot::SnapshotReader::new(open()?, 0).map_err(|e| anyhow!("{e}"))?;
+    let network = Network::from_id(header.network).ok_or_else(|| anyhow!("unknown network {} in the snapshot", header.network))?;
+    // the configuration only speaks for its own network
+    let own = network == cfg.network;
+    let params = if own { cfg.params()? } else { xdag_types::NetworkParams::for_network(network) };
+    let pow: Arc<dyn PowEngine> =
+        if own && cfg.randomx.disabled { Arc::new(NoRandomX) } else { Arc::new(xdag_randomx::RandomXEngine::with_capacity(false, 1)) };
+    let evm: Option<Arc<dyn xdag_chain::EvmEngine>> = if params.nova.is_some() { Some(Arc::new(xdag_evm::RevmEngine::new())) } else { None };
+    let opts = xdag_chain::verify::VerifyOptions { randomx_limit: randomx_limit.unwrap_or(usize::MAX) };
+    let report = xdag_chain::verify::verify(open, &params, &*pow, evm.as_ref(), &opts).map_err(|e| anyhow!("{e}"))?;
+    report.lines.iter().for_each(|l| println!("{l}"));
+    anyhow::ensure!(report.failures == 0, "{} checks failed", report.failures);
+    println!("every check that could be made passed");
+    Ok(())
+}
+
 fn archive_cmd(cfg: &NodeConfig, cmd: ArchiveCmd) -> Result<()> {
     let db = open_db(cfg)?;
     match cmd {
@@ -451,11 +549,21 @@ fn archive_cmd(cfg: &NodeConfig, cmd: ArchiveCmd) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = load_config(&cli)?;
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    // the log goes to stderr (plain text unless it is a terminal): stdout is for what a command prints
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => {
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(run(cfg))
+            let result = rt.block_on(run(cfg));
+            // end every task: they hold the last handles on the database,
+            // which is only closed cleanly (no repair on the next start) once
+            // all of them are gone
+            rt.shutdown_timeout(std::time::Duration::from_secs(10));
+            result
         }
         Cmd::Init { out } => {
             std::fs::write(&out, toml::to_string_pretty(&cfg)?)?;
@@ -474,6 +582,8 @@ fn main() -> Result<()> {
                     println!("{}", client::send_native(&url, &k, &to, &amount, fee.as_deref(), &remark)?)
                 }
                 TxCmd::Evm { to, value, data, gas } => println!("{}", client::send_evm(&url, &k, to.as_deref(), value, &data, gas)?),
+                TxCmd::Legacy { to, amount, nonce, remark } => println!("{}", client::send_legacy(&url, &k, &to, &amount, nonce, &remark)?),
+                TxCmd::FromBlock { block, to, amount, remark } => println!("{}", client::send_from_block(&url, &k, &block, &to, &amount, &remark)?),
                 TxCmd::Address => println!("xdag {}\nevm  {}", k.address(), k.evm_address().to_hex()),
             }
             Ok(())

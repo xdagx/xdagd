@@ -12,6 +12,8 @@ pub struct NodeConfig {
     pub network: Network,
     pub datadir: PathBuf,
     pub node_tag: String,
+    /// Page cache of the database, in MiB.
+    pub db_cache_mb: usize,
     pub p2p: P2pConfig,
     pub rpc: RpcConfig,
     pub pool: PoolConfig,
@@ -93,6 +95,14 @@ pub struct RandomXConfig {
     pub full_mem: bool,
     /// Disable RandomX (devnets that never reach the fork height).
     pub disabled: bool,
+    /// Seeds kept initialised at once (default 2, 256 MiB each in light mode).
+    pub cache_seeds: Option<usize>,
+    /// Devnets only: main-block height of the RandomX fork (a multiple of
+    /// `seed_epoch_blocks`), blocks between seed changes (a power of two) and
+    /// the seed lag, to reach the fork within minutes in tests.
+    pub fork_height: Option<u64>,
+    pub seed_epoch_blocks: Option<u64>,
+    pub seed_lag: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -142,6 +152,7 @@ impl NodeConfig {
             network: n,
             datadir: PathBuf::from(format!("./data-{}", n.name())),
             node_tag: "xdag-rs".into(),
+            db_cache_mb: xdag_storage::DEFAULT_CACHE_BYTES >> 20,
             p2p: P2pConfig {
                 listen: format!("0.0.0.0:{}", p.default_p2p_port).parse().unwrap(),
                 advertise_port: None,
@@ -168,7 +179,7 @@ impl NodeConfig {
                 batch_interval_ms: 1000,
             },
             nova: NovaOverrides::default(),
-            randomx: RandomXConfig { full_mem: false, disabled: n == Network::Devnet },
+            randomx: RandomXConfig { full_mem: false, disabled: n == Network::Devnet, ..RandomXConfig::default() },
             wallet: WalletConfig::default(),
         }
     }
@@ -179,6 +190,20 @@ impl NodeConfig {
             anyhow::ensure!(self.network == Network::Devnet, "epoch_bits can only be changed on devnets");
             anyhow::ensure!((8..=16).contains(&bits), "epoch_bits must be within 8..=16");
             p.epoch_bits = bits;
+        }
+        let rx = &self.randomx;
+        if rx.fork_height.is_some() || rx.seed_epoch_blocks.is_some() || rx.seed_lag.is_some() {
+            anyhow::ensure!(self.network == Network::Devnet, "the RandomX schedule can only be changed on devnets");
+            let r = &mut p.randomx;
+            r.fork_height = rx.fork_height.unwrap_or(r.fork_height);
+            r.seed_epoch_blocks = rx.seed_epoch_blocks.unwrap_or(r.seed_epoch_blocks);
+            r.seed_lag = rx.seed_lag.unwrap_or(r.seed_lag);
+            anyhow::ensure!(r.seed_epoch_blocks.is_power_of_two(), "randomx.seed_epoch_blocks must be a power of two");
+            anyhow::ensure!(
+                r.fork_height >= r.seed_epoch_blocks && r.fork_height.is_multiple_of(r.seed_epoch_blocks),
+                "randomx.fork_height must be a positive multiple of seed_epoch_blocks"
+            );
+            anyhow::ensure!(r.seed_lag < r.fork_height, "randomx.seed_lag must be below the fork height");
         }
         let o = &self.nova;
         if o.activation_epoch.is_some()
@@ -268,5 +293,18 @@ mod tests {
         // and it parses from the configuration file
         let c = NodeConfig::from_toml("network = \"testnet\"\n[p2p]\nallow = [\"10.0.0.7\"]\n").unwrap();
         assert_eq!(c.p2p.allow, vec!["10.0.0.7".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn the_randomx_schedule_can_only_be_shortened_on_devnets() {
+        let toml = |net: &str, rx: &str| NodeConfig::from_toml(&format!("network = \"{net}\"\n[randomx]\n{rx}\n")).unwrap().params();
+        let p = toml("devnet", "fork_height = 16\nseed_epoch_blocks = 8\nseed_lag = 2").unwrap();
+        assert_eq!((p.randomx.fork_height, p.randomx.seed_epoch_blocks, p.randomx.seed_lag), (16, 8, 2));
+        assert!(toml("mainnet", "fork_height = 16").is_err());
+        assert!(toml("devnet", "fork_height = 12\nseed_epoch_blocks = 8").is_err(), "not a multiple of the seed epoch");
+        assert!(toml("devnet", "fork_height = 16\nseed_epoch_blocks = 6").is_err(), "not a power of two");
+        // untouched defaults are xdagj's
+        let d = NodeConfig::for_network(Network::Mainnet).params().unwrap().randomx;
+        assert_eq!((d.fork_height, d.seed_epoch_blocks, d.seed_lag), (1_540_096, 4096, 128));
     }
 }

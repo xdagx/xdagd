@@ -7,6 +7,15 @@ use xdag_types::{Address, FieldType, HashLow, Nano};
 
 use crate::{param, param_str, Backend, RpcError, RpcResult};
 
+// xdagj's result codes (io.xdag.rpc.error.JsonRpcError)
+const ERR_XDAG_ADDRESS: i64 = -10000;
+const ERR_XDAG_DEST: i64 = -10001;
+const ERR_XDAG_TX: i64 = -10101;
+const ERR_XDAG_BALANCE: i64 = -10201;
+const ERR_XDAG_WALLET: i64 = -10300;
+const ERR_XDAG_WALLET_LOCKED: i64 = -10301;
+const ERR_XDAG_PARAM: i64 = -10500;
+
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 500;
 
@@ -57,8 +66,11 @@ pub fn parse_target(s: &str) -> Result<Target, RpcError> {
     HashLow::from_xdagj_hex(s).map(Target::Block).map_err(|_| RpcError::invalid("bad hash or address"))
 }
 
-fn block_type(v: &BlockView) -> &'static str {
-    if v.info.snapshot.is_some() {
+/// xdagj `getType`. A block inherited from a snapshot is reported as
+/// "Snapshot" when it is looked up by itself; in listings xdagj classifies it
+/// like any other block (it has no links there, so it is "Main" or "Wallet").
+fn block_type(v: &BlockView, brief: bool) -> &'static str {
+    if v.info.snapshot.is_some() && !brief {
         return "Snapshot";
     }
     if state_by_flags(v.flags()) == "Main" {
@@ -66,6 +78,7 @@ fn block_type(v: &BlockView) -> &'static str {
     }
     match &v.block {
         Some(b) if b.insigs.is_empty() && b.inputs.is_empty() && b.outputs.is_empty() => "Wallet",
+        None if v.info.snapshot.is_some() => "Wallet",
         _ => "Transaction",
     }
 }
@@ -156,7 +169,7 @@ fn block_json(b: &dyn Backend, v: &BlockView, page: usize, page_size: usize, ran
         "address": v.hashlow.to_legacy_address(),
         "remark": remark,
         "diff": xdag_types::difficulty::to_quantity_hex(v.info.difficulty),
-        "type": block_type(v),
+        "type": block_type(v, brief),
         "flags": format!("{:x}", v.flags()),
     });
     if let (Some(pl), Some(n)) = (&v.payload, (v.info.payload_txs > 0).then_some(v.info.payload_txs)) {
@@ -171,6 +184,10 @@ fn block_json(b: &dyn Backend, v: &BlockView, page: usize, page_size: usize, ran
         let (txs, total) = paged_history(b, &Target::Block(v.hashlow), page, page_size, range)?;
         let mut txs = txs;
         if state_by_flags(v.flags()) == "Main" {
+            // xdagj lists the block's own earnings as one entry; the history
+            // records them too, so that entry is replaced, not added to
+            let own = v.hashlow.to_xdagj_hex();
+            txs.retain(|t| !(t["direction"] == 2 && t["hashlow"] == own.as_str()));
             let reward = xdag_chain::fees::reward(v.state.height, b.params());
             txs.insert(
                 0,
@@ -227,7 +244,7 @@ fn get_by_hash(b: &dyn Backend, params: &Value) -> RpcResult {
     let (page, size, range) = parse_page_args(params);
     match parse_target(&param_str(params, 0)?)? {
         Target::Account(a) => account_json(b, &a, page, size, range),
-        Target::Block(h) => match query::block_view(b.db(), &h)? {
+        Target::Block(h) => match b.block_view(&h).map_err(RpcError::internal)? {
             Some(v) => block_json(b, &v, page, size, range, false),
             None => Ok(Value::Null),
         },
@@ -244,7 +261,7 @@ pub fn handle(b: &dyn Backend, method: &str, params: &Value) -> RpcResult {
         "xdag_getBalance" => match parse_target(&param_str(params, 0)?)? {
             Target::Account(a) => Ok(json!(xdag_amount(query::balance(b.db(), &a)?))),
             Target::Block(h) => {
-                let v = query::block_view(b.db(), &h)?.ok_or_else(|| RpcError::exec("block not found"))?;
+                let v = b.block_view(&h).map_err(RpcError::internal)?.ok_or_else(|| RpcError::exec("block not found"))?;
                 Ok(json!(signed_amount(v.state.amount)))
             }
         },
@@ -382,31 +399,45 @@ pub fn handle(b: &dyn Backend, method: &str, params: &Value) -> RpcResult {
                     "client": p.client_id, "nova": p.nova, "score": p.score}))
                 .collect::<Vec<_>>()))
         }
-        "xdag_getChainInfo" => Ok(json!({
-            "network": p.network.name(),
-            "novaActivationEpoch": p.nova.as_ref().map(|n| n.activation_epoch),
-            "chainId": p.nova.as_ref().map(|n| n.chain_id),
-            "epochSeconds": (1u64 << p.epoch_bits) / 1024,
-            "minGas": xdag_amount(p.min_gas),
-            "minNativeFee": p.nova.as_ref().map(|n| xdag_amount(n.min_native_fee)),
-            "minGasPrice": p.nova.as_ref().map(|n| n.min_gas_price.to_string()),
-            "client": b.client_version(),
-        })),
+        "xdag_getChainInfo" => {
+            let rx = query::rx_schedule(b.db())?;
+            let seeds: Vec<Value> =
+                rx.seeds.iter().map(|s| json!({"height": s.height, "switchEpoch": s.switch_epoch, "key": hex::encode(s.key)})).collect();
+            Ok(json!({
+                "network": p.network.name(),
+                "randomx": {"forkHeight": p.randomx.fork_height, "forkEpoch": rx.fork_epoch, "seeds": seeds},
+                "novaActivationEpoch": p.nova.as_ref().map(|n| n.activation_epoch),
+                "chainId": p.nova.as_ref().map(|n| n.chain_id),
+                "epochSeconds": (1u64 << p.epoch_bits) / 1024,
+                "minGas": xdag_amount(p.min_gas),
+                "minNativeFee": p.nova.as_ref().map(|n| xdag_amount(n.min_native_fee)),
+                "minGasPrice": p.nova.as_ref().map(|n| n.min_gas_price.to_string()),
+                "client": b.client_version(),
+            }))
+        }
         "xdag_personal_sendTransaction" | "xdag_personal_sendSafeTransaction" => {
+            // xdagj reports every outcome inside the result object, with its own codes
+            let fail = |code: i64, msg: &str| Ok(json!({"code": code, "result": Value::Null, "resInfo": Value::Null, "errMsg": msg}));
             let req = param(params, 0).cloned().unwrap_or(Value::Null);
             let pass = param_str(params, 1).unwrap_or_default();
-            let to = req.get("to").and_then(|v| v.as_str()).ok_or_else(|| RpcError::invalid("missing to"))?;
-            let value = req.get("value").and_then(|v| v.as_str()).ok_or_else(|| RpcError::invalid("missing value"))?;
-            let remark = req.get("remark").and_then(|v| v.as_str()).unwrap_or("");
-            let from = req.get("from").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-            let to = Address::parse(to).map_err(|_| RpcError::invalid("To address is illegal"))?;
+            let text = |k: &str| req.get(k).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+            let Some(to) = text("to") else { return fail(ERR_XDAG_DEST, "To address is illegal") };
+            let Ok(to) = Address::parse(to) else { return fail(ERR_XDAG_ADDRESS, "To address is illegal") };
+            let from = match text("from").map(Address::parse) {
+                None => None,
+                Some(Ok(a)) => Some(a),
+                Some(Err(_)) => return fail(ERR_XDAG_ADDRESS, "From address is illegal"),
+            };
             // exact decimal parsing (xdagj rounded amounts to 0.01 XDAG through a double)
-            let amount = Nano::parse_xdag(value).map_err(|_| RpcError::invalid("The transfer amount is invalid"))?;
-            let from = from.map(Address::parse).transpose().map_err(|_| RpcError::invalid("From address is illegal"))?;
-            Ok(match b.wallet_transfer(from, to, amount, remark, &pass) {
-                Ok(res) => json!({"code": 0, "result": res, "errMsg": Value::Null}),
-                Err(e) => json!({"code": -10200, "result": Value::Null, "errMsg": e}),
-            })
+            let Some(Ok(amount)) = text("value").map(Nano::parse_xdag) else { return fail(ERR_XDAG_PARAM, "The transfer amount is invalid") };
+            let remark = text("remark").unwrap_or("");
+            match b.wallet_transfer(from, to, amount, remark, &pass) {
+                Ok(res) => Ok(json!({"code": 0, "result": res, "resInfo": res, "errMsg": Value::Null})),
+                Err(e) if e == "balance not enough" => fail(ERR_XDAG_BALANCE, &e),
+                Err(e) if e == "wallet unlock failed" => fail(ERR_XDAG_WALLET_LOCKED, &e),
+                Err(e) if e.contains("wallet") => fail(ERR_XDAG_WALLET, &e),
+                Err(e) => fail(ERR_XDAG_TX, &e),
+            }
         }
         _ => Err(RpcError::not_found(method)),
     }

@@ -13,6 +13,7 @@
 //! * **Atomic multi-table commits.** A block import (and any main-chain
 //!   changes it triggers) is written as one transaction.
 
+pub mod bulk;
 pub mod codec;
 
 use parking_lot::Mutex;
@@ -21,6 +22,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use bulk::BulkLoader;
 pub use codec::{Reader, Writer};
 
 /// Current schema version written by this build.
@@ -190,18 +192,27 @@ pub struct Migration {
 pub struct Db {
     inner: Arc<Database>,
     write_lock: Arc<Mutex<()>>,
+    path: Arc<std::path::PathBuf>,
 }
 
 const SCHEMA_KEY: &[u8] = b"schema_version";
 
+/// Page cache of a database opened with [`Db::open`].
+pub const DEFAULT_CACHE_BYTES: usize = 256 << 20;
+
 impl Db {
     /// Open (or create) a database and bring it to [`SCHEMA_VERSION`].
     pub fn open(path: &Path, migrations: &[Migration]) -> Result<Db> {
+        Self::open_with_cache(path, migrations, DEFAULT_CACHE_BYTES)
+    }
+
+    /// [`Db::open`] with a page cache of `cache_bytes`.
+    pub fn open_with_cache(path: &Path, migrations: &[Migration], cache_bytes: usize) -> Result<Db> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StorageError::Db(e.to_string()))?;
         }
-        let database = Database::builder().set_cache_size(256 << 20).create(path)?;
-        let db = Db { inner: Arc::new(database), write_lock: Arc::new(Mutex::new(())) };
+        let database = Database::builder().set_cache_size(cache_bytes).create(path)?;
+        let db = Db { inner: Arc::new(database), write_lock: Arc::new(Mutex::new(())), path: Arc::new(path.to_path_buf()) };
         // make sure every table exists so readers never fail on a missing table
         {
             let wtx = db.inner.begin_write()?;
@@ -220,6 +231,11 @@ impl Db {
         std::fs::create_dir_all(&dir).map_err(|e| StorageError::Db(e.to_string()))?;
         let db = Db::open(&dir.join("chain.redb"), &[])?;
         Ok((db, TempDirGuard(dir)))
+    }
+
+    /// The database file.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn schema_version(&self) -> Result<Option<u32>> {

@@ -44,7 +44,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use xdag_storage::{Db, Table};
+use xdag_storage::{BulkLoader, Db, Table};
 use xdag_types::{Address, BlockHash, Difficulty, HashLow, Nano, Network, U256};
 
 use crate::chain::Chain;
@@ -61,6 +61,9 @@ pub const STATUS_UNKNOWN: u8 = 0xff;
 
 /// Execution-record tables carried verbatim.
 pub const RECORD_TABLES: [Table; 6] = [Table::Code, Table::Storage, Table::History, Table::TxIndex, Table::Receipt, Table::EvmTxs];
+
+/// Rows an import sorts in memory before it goes through temporary files.
+const LOADER_MEMORY: usize = 64 << 20;
 
 const MAX_ROW_KEY: usize = 1 << 10;
 const MAX_ROW_VALUE: usize = 16 << 20;
@@ -463,18 +466,25 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
     chain.ov.put(Table::Meta, keys::META_SNAPSHOT_IMPORT.to_vec(), vec![1])?;
     chain.commit(true)?;
 
-    for i in 0..r.section()? {
+    // Blocks are keyed by their hash and arrive in any order: the rows are
+    // sorted before they are inserted (see `BulkLoader`).
+    let mut rows = BulkLoader::new(&chain.db().path().with_extension("import"), LOADER_MEMORY)?;
+
+    for _ in 0..r.section()? {
         let (a, rec) = r.account()?;
-        chain.put_account(&a, &rec)?;
-        if i % 100_000 == 99_999 {
-            chain.commit(false)?;
-        }
+        rows.put(Table::Account, &a.0, &rec.encode())?;
     }
 
     let mut stored = 0u64;
+    // highest main block that comes without its data: the exporter inherited
+    // it from a snapshot of its own
+    let mut inherited_main: Option<u64> = None;
     for i in 0..r.section()? {
         let blk = r.block()?;
         let (hashlow, fl) = (blk.hashlow, blk.flags);
+        if fl & flags::MAIN != 0 && !matches!(blk.data, SnapshotData::Full { .. }) {
+            inherited_main = inherited_main.max(Some(blk.height));
+        }
         let mut info = BlockInfo {
             hash: blk.hash,
             time: blk.time,
@@ -509,16 +519,24 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
                 if let Some(pl) = &pre.payload {
                     info.ext_root = b.ext_root;
                     info.payload_txs = pl.txs.len() as u32;
-                    chain.ov.put(Table::Payload, hashlow.0.to_vec(), payload.as_deref().cloned().unwrap_or_default())?;
+                    rows.put(Table::Payload, &hashlow.0, payload.as_deref().map(|p| &p[..]).unwrap_or_default())?;
                 }
+                // a processed transaction was applied, rejected (it then has
+                // the main block that judged it) or skipped over a nonce gap
                 if blk.status == STATUS_UNKNOWN && b.is_tx() && fl & flags::MAIN_REF != 0 {
-                    status = if fl & flags::APPLIED != 0 { TxStatus::Applied } else { TxStatus::Rejected } as u8;
+                    status = if fl & flags::APPLIED != 0 {
+                        TxStatus::Applied
+                    } else if blk.ref_.is_some() {
+                        TxStatus::Rejected
+                    } else {
+                        TxStatus::Pending
+                    } as u8;
                 }
-                chain.ov.put(Table::BlockRaw, hashlow.0.to_vec(), raw.to_vec())?;
-                chain.ov.put(Table::TimeIndex, keys::time_index(ep.epoch(blk.time), &hashlow), vec![])?;
+                rows.put(Table::BlockRaw, &hashlow.0, &raw[..])?;
+                rows.put(Table::TimeIndex, &keys::time_index(ep.epoch(blk.time), &hashlow), &[])?;
                 crate::sums::add_block(&mut chain.ov, blk.time, b.sum())?;
                 if fl & flags::REF == 0 {
-                    chain.ov.put(Table::NoRef, hashlow.0.to_vec(), vec![])?;
+                    rows.put(Table::NoRef, &hashlow.0, &[])?;
                 }
                 stored += 1;
             }
@@ -526,42 +544,39 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
             // unknown key: unspendable, but still a valid reference target
             SnapshotData::None => info.snapshot = Some(SnapshotKey::PublicKey([0u8; 33])),
         }
-        chain.put_info(&hashlow, info)?;
+        rows.put(Table::BlockInfo, &hashlow.0, &info.encode())?;
         let st = BlockState { flags: fl & flags::APPLY_MASK, amount: blk.amount, fee: blk.fee, ref_: blk.ref_, height: blk.height, status };
         // blocks no main block has touched have no execution state
         if st != BlockState::default() {
-            chain.put_state(&hashlow, &st)?;
+            rows.put(Table::BlockState, &hashlow.0, &st.encode())?;
         }
         if i % 100_000 == 99_999 {
+            // the per-range block checksums accumulate in the overlay
             chain.commit(false)?;
         }
     }
 
-    for i in 0..r.section()? {
+    for _ in 0..r.section()? {
         let (h, hl) = r.main()?;
-        chain.ov.put(Table::MainHeight, keys::height(h), hl.0.to_vec())?;
-        if i % 100_000 == 99_999 {
-            chain.commit(false)?;
-        }
+        rows.put(Table::MainHeight, &keys::height(h), &hl.0)?;
     }
 
     for _ in 0..r.tables()? {
-        let (t, rows) = r.table()?;
-        for i in 0..rows {
+        let (t, n) = r.table()?;
+        for _ in 0..n {
             let (k, v) = r.row()?;
-            chain.ov.put(t, k, v)?;
-            if i % 100_000 == 99_999 {
-                chain.commit(false)?;
-            }
+            rows.put(t, &k, &v)?;
         }
     }
     r.finish()?;
+    chain.commit(false)?;
+    rows.finish(chain.db())?;
 
     let (nmain, top, top_diff) = (header.nmain, header.top, header.top_diff);
     chain.meta = ChainMeta { nmain, top: Some(top), top_diff, nblocks: chain.meta.nblocks + stored, snapshot_height: nmain };
     chain.mark_meta_dirty();
     chain.commit(false)?;
-    let rebuilt = rebuild_rx(chain)?;
+    let rebuilt = rebuild_rx(chain, inherited_main)?;
     let rx = match header.rx {
         None => rebuilt,
         Some(sr) if same_effect(&sr, &rebuilt) => sr,
@@ -575,12 +590,15 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
 }
 
 /// The RandomX state new blocks depend on (fork epoch and the last two seeds),
-/// as replaying every main block would leave it. When the fork block itself is
-/// not part of the history (nodes bootstrapped from an xdagj snapshot lack
-/// it), the fork epoch comes from the first main block known after it, as
-/// xdagj does after loading its snapshots: any past epoch is equivalent for
-/// new blocks.
-fn rebuild_rx(chain: &mut Chain) -> Result<RxSchedule> {
+/// as replaying every main block would leave it.
+///
+/// A chain taken over from an xdagj node that was itself started from a
+/// snapshot (`inherited` is the highest main block it has no data for, its
+/// snapshot height) lacks the fork block. Such a node counts the fork from the
+/// last seed height at or below its snapshot height and scores older
+/// candidates by sha256d (`randomXLoadingSnapshotJ`); the line is drawn in the
+/// same place here.
+fn rebuild_rx(chain: &mut Chain, inherited: Option<u64>) -> Result<RxSchedule> {
     let p = chain.params().clone();
     let rx = &p.randomx;
     let ep = p.epochs();
@@ -590,15 +608,11 @@ fn rebuild_rx(chain: &mut Chain) -> Result<RxSchedule> {
         return Ok(s);
     }
     let missing = |h: u64| ChainError::Invalid(format!("snapshot lacks main block {h} needed for the RandomX schedule"));
-    let fork_time = match main_time(chain, rx.fork_height)? {
-        Some((_, t)) => t,
-        None => {
-            let first = chain.db().scan_range(Table::MainHeight, &keys::height(rx.fork_height), None, 1, false)?;
-            let (_, v) = first.into_iter().next().ok_or_else(|| missing(rx.fork_height))?;
-            let hl = HashLow::from_slice(&v).ok_or_else(|| missing(rx.fork_height))?;
-            chain.info(&hl)?.ok_or_else(|| missing(rx.fork_height))?.time
-        }
+    let base = match inherited {
+        Some(h) if h > rx.fork_height => h - h % rx.seed_epoch_blocks,
+        _ => rx.fork_height,
     };
+    let (_, fork_time) = main_time(chain, base)?.ok_or_else(|| missing(base))?;
     s.fork_epoch = Some(ep.epoch(fork_time) + rx.seed_lag);
     let last = nmain & !(rx.seed_epoch_blocks - 1);
     for h in [last.checked_sub(rx.seed_epoch_blocks), Some(last)].into_iter().flatten() {
@@ -781,4 +795,220 @@ pub fn describe<T: Read>(input: T) -> Result<SnapshotSummary> {
     }
     r.finish()?;
     Ok(s)
+}
+
+/// Result of comparing two snapshots (`xdagd snapshot diff`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotDiff {
+    /// Human-readable findings, most important first.
+    pub lines: Vec<String>,
+    /// Differences in consensus state: accounts, block balances, execution
+    /// flags, fees, heights, difficulties and the main-chain index.
+    pub state_differences: u64,
+    /// Blocks only one side knows (each node holds a few unconfirmed blocks
+    /// the other has not seen or has not kept).
+    pub only_in_first: u64,
+    pub only_in_second: u64,
+}
+
+/// What two nodes must agree on about a block.
+struct BlockMeta {
+    time: u64,
+    flags: u8,
+    status: u8,
+    height: u64,
+    difficulty: Difficulty,
+    max_diff_link: Option<HashLow>,
+    amount: i64,
+    fee: Nano,
+    ref_: Option<HashLow>,
+    has_data: bool,
+}
+
+/// Marks of the exporting node that are not consensus state.
+const LOCAL_FLAGS: u8 = flags::OURS | flags::EXTRA | flags::REMARK;
+
+impl BlockMeta {
+    fn of(b: &SnapshotBlock) -> BlockMeta {
+        BlockMeta {
+            time: b.time,
+            flags: b.flags,
+            status: b.status,
+            height: b.height,
+            difficulty: b.difficulty,
+            max_diff_link: b.max_diff_link,
+            amount: b.amount,
+            fee: b.fee,
+            ref_: b.ref_,
+            has_data: matches!(b.data, SnapshotData::Full { .. }),
+        }
+    }
+
+    /// Everything that is compared, condensed (the status apart: an exporter
+    /// may not know it).
+    fn digest(&self) -> [u8; 7] {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.time, self.flags & !LOCAL_FLAGS, self.height, self.difficulty, self.max_diff_link, self.amount, self.fee.0, self.ref_, self.has_data)
+            .hash(&mut h);
+        let mut d = [0u8; 7];
+        d.copy_from_slice(&h.finish().to_le_bytes()[..7]);
+        d
+    }
+
+    fn same_status(a: u8, b: u8) -> bool {
+        a == b || a == STATUS_UNKNOWN || b == STATUS_UNKNOWN
+    }
+
+    fn differences(&self, o: &BlockMeta) -> Vec<String> {
+        let mut what = vec![];
+        if self.time != o.time {
+            what.push(format!("time {:x}/{:x}", self.time, o.time));
+        }
+        if (self.flags & !LOCAL_FLAGS) != (o.flags & !LOCAL_FLAGS) {
+            what.push(format!("flags {:02x}/{:02x}", self.flags & !LOCAL_FLAGS, o.flags & !LOCAL_FLAGS));
+        }
+        if !Self::same_status(self.status, o.status) {
+            what.push(format!("status {}/{}", self.status, o.status));
+        }
+        if self.height != o.height {
+            what.push(format!("height {}/{}", self.height, o.height));
+        }
+        if self.difficulty != o.difficulty {
+            what.push(format!("difficulty {:x}/{:x}", self.difficulty, o.difficulty));
+        }
+        if self.max_diff_link != o.max_diff_link {
+            what.push(format!("max-diff link {:?}/{:?}", self.max_diff_link, o.max_diff_link));
+        }
+        if self.amount != o.amount {
+            what.push(format!("balance {}/{} nano", self.amount, o.amount));
+        }
+        if self.fee != o.fee {
+            what.push(format!("fee {}/{} nano", self.fee.0, o.fee.0));
+        }
+        if self.ref_ != o.ref_ {
+            what.push(format!("ref {:?}/{:?}", self.ref_, o.ref_));
+        }
+        if self.has_data != o.has_data {
+            what.push(format!("block data present {}/{}", self.has_data, o.has_data));
+        }
+        what
+    }
+}
+
+/// Compare the consensus state in two snapshots taken at the same point of
+/// the same chain, e.g. one exported from an xdagj node and one from an xdagd
+/// node that followed it. Node-local marks (our-block flag) are ignored.
+///
+/// The second snapshot is streamed against 32 bytes per block kept of the
+/// first, which is read once more to describe the blocks that differ.
+pub fn diff<A: Read, B: Read>(mut first: impl FnMut() -> Result<A>, second: B) -> Result<SnapshotDiff> {
+    const SHOWN: usize = 8;
+    let (mut ra, ha) = SnapshotReader::new(first()?, MAX_ROW_VALUE)?;
+    let mut accounts = std::collections::BTreeMap::new();
+    for _ in 0..ra.section()? {
+        let (a, rec) = ra.account()?;
+        // legacy balances compare by the value xdagj shows for them
+        accounts.insert(a, (rec.balance_wei()?, rec.nonce, rec.code_hash));
+    }
+    let count_a = (accounts.len(), ra.section()?);
+    let mut blocks: Vec<(HashLow, [u8; 7], u8)> = Vec::with_capacity(count_a.1 as usize);
+    for _ in 0..count_a.1 {
+        let b = ra.block()?;
+        let m = BlockMeta::of(&b);
+        blocks.push((b.hashlow, m.digest(), m.status));
+    }
+    blocks.sort_unstable_by_key(|e| e.0);
+    let mut mains: Vec<(u64, HashLow)> = (0..ra.section()?).map(|_| ra.main()).collect::<Result<_>>()?;
+    mains.sort_unstable();
+    drop(ra);
+
+    let (mut rb, hb) = SnapshotReader::new(second, MAX_ROW_VALUE)?;
+    if ha.network != hb.network {
+        return Err(ChainError::Invalid("the snapshots are of different networks".into()));
+    }
+    let mut d = SnapshotDiff::default();
+    d.lines.push(format!("main height: {} / {}", ha.nmain, hb.nmain));
+    if ha.nmain != hb.nmain {
+        d.lines.push("  (different heights: states are only comparable at the same main height)".into());
+    }
+    let note = |d: &mut SnapshotDiff, shown: &mut usize, line: String| {
+        d.state_differences += 1;
+        *shown += 1;
+        if *shown <= SHOWN {
+            d.lines.push(line);
+        }
+    };
+
+    let (mut shown, count_b) = (0, rb.section()?);
+    for _ in 0..count_b {
+        let (addr, rec) = rb.account()?;
+        let vb = (rec.balance_wei()?, rec.nonce, rec.code_hash);
+        match accounts.remove(&addr) {
+            None => note(&mut d, &mut shown, format!("account {addr}: only in the second")),
+            Some(va) if va != vb => {
+                note(&mut d, &mut shown, format!("account {addr}: balance {} wei nonce {} / balance {} wei nonce {}", va.0, va.1, vb.0, vb.1))
+            }
+            _ => {}
+        }
+    }
+    for addr in accounts.keys() {
+        note(&mut d, &mut shown, format!("account {addr}: only in the first"));
+    }
+    d.lines.push(format!("accounts: {} / {count_b}, {shown} differ", count_a.0));
+
+    let count_b = rb.section()?;
+    let mut seen = vec![false; blocks.len()];
+    let (mut differing, mut common) = (0usize, 0u64);
+    let mut detail: std::collections::HashMap<HashLow, BlockMeta> = Default::default();
+    for _ in 0..count_b {
+        let b = rb.block()?;
+        let Ok(i) = blocks.binary_search_by_key(&b.hashlow, |e| e.0) else {
+            d.only_in_second += 1;
+            continue;
+        };
+        seen[i] = true;
+        common += 1;
+        let m = BlockMeta::of(&b);
+        if blocks[i].1 != m.digest() || !BlockMeta::same_status(blocks[i].2, m.status) {
+            differing += 1;
+            if detail.len() < SHOWN {
+                detail.insert(b.hashlow, m);
+            }
+        }
+    }
+    d.only_in_first = seen.iter().filter(|s| !**s).count() as u64;
+
+    let (mut shown, mut common_mains, mains_b) = (0, 0usize, rb.section()?);
+    for _ in 0..mains_b {
+        let (h, hl) = rb.main()?;
+        if let Ok(i) = mains.binary_search_by_key(&h, |e| e.0) {
+            common_mains += 1;
+            if mains[i].1 != hl {
+                note(&mut d, &mut shown, format!("main block {h}: {} / {}", mains[i].1.to_legacy_address(), hl.to_legacy_address()));
+            }
+        }
+    }
+    d.lines.push(format!("main-chain index: {} / {mains_b} entries, {common_mains} in common, {shown} differ", mains.len()));
+    drop(rb);
+
+    // the blocks that differ, described from both sides
+    d.state_differences += differing as u64;
+    if !detail.is_empty() {
+        let (mut ra, _) = SnapshotReader::new(first()?, MAX_ROW_VALUE)?;
+        for _ in 0..ra.section()? {
+            ra.account()?;
+        }
+        for _ in 0..ra.section()? {
+            let b = ra.block()?;
+            if let Some(mb) = detail.get(&b.hashlow) {
+                d.lines.push(format!("block {}: {}", b.hashlow.to_legacy_address(), BlockMeta::of(&b).differences(mb).join(", ")));
+            }
+        }
+    }
+    d.lines.push(format!(
+        "blocks: {} / {count_b}, {common} in common of which {differing} differ; {} only in the first, {} only in the second",
+        count_a.1, d.only_in_first, d.only_in_second
+    ));
+    Ok(d)
 }

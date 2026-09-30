@@ -46,6 +46,47 @@ fn pct(amount: Nano, percent: f64) -> Nano {
 }
 
 impl RewardManager {
+    /// Payouts still owed, as saved by [`RewardManager::save`]. They are due 16
+    /// epochs after a block was found: kept only in memory (as xdagj does),
+    /// every restart would leave the blocks found just before it unpaid.
+    pub fn load(path: &std::path::Path) -> RewardManager {
+        let mut m = RewardManager::default();
+        let Ok(text) = std::fs::read_to_string(path) else { return m };
+        let parsed: Option<()> = (|| {
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            for e in v.get("pending")?.as_array()? {
+                m.pending.push_back(MinedBlock {
+                    epoch: e.get("epoch")?.as_u64()?,
+                    block: HashLow::from_slice(&hex::decode(e.get("block")?.as_str()?).ok()?)?,
+                    pool: Address::from_slice(&hex::decode(e.get("pool")?.as_str()?).ok()?)?,
+                    solo: e.get("solo")?.as_bool()?,
+                });
+            }
+            for e in v.get("node_batch")?.as_array()? {
+                let block = HashLow::from_slice(&hex::decode(e.get(0)?.as_str()?).ok()?)?;
+                m.node_batch.push((block, Nano(e.get(1)?.as_u64()?)));
+            }
+            Some(())
+        })();
+        if parsed.is_none() {
+            tracing::warn!(file = %path.display(), "unreadable reward state: pending payouts before this restart are lost");
+            return RewardManager::default();
+        }
+        m
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let v = serde_json::json!({
+            "pending": self.pending.iter().map(|m| serde_json::json!({
+                "epoch": m.epoch, "block": hex::encode(m.block.0), "pool": hex::encode(m.pool.0), "solo": m.solo,
+            })).collect::<Vec<_>>(),
+            "node_batch": self.node_batch.iter().map(|(b, n)| serde_json::json!([hex::encode(b.0), n.0])).collect::<Vec<_>>(),
+        });
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, v.to_string())?;
+        std::fs::rename(&tmp, path)
+    }
+
     /// Remember a candidate we produced whose nonce came from a pool.
     pub fn record(&mut self, b: &Block, epoch: u64) {
         let (Some(pool), Some(cb)) = (b.nonce_address(), b.coinbase) else { return };
@@ -133,5 +174,31 @@ mod tests {
     fn percentages_are_exact() {
         assert_eq!(pct(Nano::from_xdag(64), 5.0), Nano(3_200_000_000));
         assert_eq!(pct(Nano(1_000_000_007), 5.0), Nano(50_000_000));
+    }
+
+    #[test]
+    fn pending_payouts_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("xdag-rewards-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("rewards.json");
+        assert!(RewardManager::load(&file).pending.is_empty(), "no file yet");
+
+        let mut m = RewardManager::default();
+        m.pending.push_back(MinedBlock { epoch: 7, block: HashLow([1u8; 24]), pool: Address([2u8; 20]), solo: false });
+        m.pending.push_back(MinedBlock { epoch: 8, block: HashLow([3u8; 24]), pool: Address([4u8; 20]), solo: true });
+        m.node_batch.push((HashLow([5u8; 24]), Nano(123)));
+        m.save(&file).unwrap();
+
+        let mut again = RewardManager::load(&file);
+        assert_eq!(again.node_batch, m.node_batch);
+        let due = again.due(7 + 16, 16);
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].block, due[0].pool, due[0].solo), (HashLow([1u8; 24]), Address([2u8; 20]), false));
+        assert_eq!(again.pending.len(), 1);
+
+        // a damaged file is not fatal
+        std::fs::write(&file, "{ not json").unwrap();
+        assert!(RewardManager::load(&file).pending.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

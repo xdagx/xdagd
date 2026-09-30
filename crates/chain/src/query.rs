@@ -29,6 +29,14 @@ impl BlockView {
     }
 }
 
+/// The persisted RandomX fork state (fork epoch and seeds).
+pub fn rx_schedule(db: &Db) -> Result<crate::pow::RxSchedule> {
+    match db.get(Table::Meta, keys::META_RX)? {
+        Some(b) => crate::pow::RxSchedule::decode(&b).ok_or_else(|| ChainError::Corrupt("randomx schedule".into())),
+        None => Ok(Default::default()),
+    }
+}
+
 pub fn chain_meta(db: &Db) -> Result<ChainMeta> {
     Ok(match db.get(Table::Meta, keys::META_CHAIN)? {
         Some(b) => ChainMeta::decode(&b)?,

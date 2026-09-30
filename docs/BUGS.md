@@ -24,6 +24,12 @@
 - 测试：`legacy_rules_let_a_ground_link_block_take_the_main_block`、`nova_rules_ignore_hash_grinding_of_non_candidates`、
   `legacy_rules_let_a_disconnected_ground_block_unwind_the_whole_chain`、`nova_rules_ignore_a_disconnected_ground_block`。
 
+- 主网上的实例：高度 4,240,061 的主网快照里，有三笔矿池发奖交易自己成了主块（高度 3,039,096、3,122,371、3,132,645，
+  2024 年 4 到 6 月），各拿到 64 XDAG 奖励。它们不是挖出来的：当时交易块也按哈希计算难度，那个 epoch 又没有别的候选块。
+  xdagj 后来把带输入的区块的难度改为 1，但无输入的区块仍然按哈希计分。
+  另外，主网的累计难度约为 2^107.7，其中 2022 年 7 月以来的 200 万个主块合计只贡献了 2^86.3（平均每块 2^65.4）：
+  一个哈希前导零足够多（约 54 位）的 SHA256 区块，自身难度就超过这 200 万个主块的总和。
+
 > 这是去掉白名单之前**必须**先激活 Nova 的原因，见 [MIGRATION.md](MIGRATION.md)。
 
 ### C2. 同一来源区块的重复 IN：区块余额变负，凭空增发 — **严重，Nova 修复**
@@ -33,6 +39,10 @@
   每次都通过检查，扣减后余额为负，输出方多拿到的钱是凭空产生的。任何拥有区块余额的人（即挖到过主块的人）都可以利用。
 - 处理：Nova 规则下按来源区块汇总后再检查余额。
 - 测试：`legacy_rules_allow_the_duplicate_in_double_spend`（记录旧行为）、`duplicate_in_links_cannot_double_spend_a_block_balance`。
+- 主网上很可能已经发生过：高度 4,240,061 的主网快照里有两个主块的余额是 −0.642 XDAG
+  （高度 3,720,009，2025-09-06；高度 3,854,292，2025-12-14，分属两个矿池）。两个块各收入 64.2 XDAG，0.642 正好是它的 1%：
+  余额剩下最后 1% 时，一笔交易对这个块引用两次、每次取 1%，两次检查都通过，扣完就是 −0.642。
+  仅凭快照无法确认是哪一笔交易，需要 xdagj 的开发者从历史数据里核实。
 
 ### C3. 同步时采用对端给出的交易执行结果 — **严重，已修复**
 
@@ -61,6 +71,7 @@
 - 给一个新地址转账的交易还没执行时，从这个地址转出的交易会被判为无效并丢弃；
   不同节点收到区块的顺序不同，结果就可能不同。
 - 处理：两种规则下都改为"暂缓，下一个主块确认后重试"；Nova 规则下取消这条检查。
+- 在对接测试中观察到了这个问题：清库重新同步的 xdagj 把两个交易块判为 `INVALID_BLOCK`（`Address isn't exist`），见 [INTEROP.md](INTEROP.md)。
 - 测试：`import_order_does_not_change_the_result`。
 
 ### C7. 回滚时手续费统计漂移 — **低，已修复**
@@ -109,8 +120,9 @@ xdagj 的历史丢失由三件事共同造成：
 
 ### S3. 快照升级之后，快照之前的"主交易"可以被重放一次 — **中低，随快照机制一起消除**
 
-- 位置：`BlockchainImpl.isExist`（`hasBlock || hasBlockInfo`）与 `SnapshotStoreImpl.makeSnapshot`（只保留余额不为零的区块）
-- 每次快照升级后，余额为零的旧区块（包括所有已执行的交易块）被彻底遗忘。把一个旧交易块的原始数据重新广播，
+- 位置：`BlockchainImpl.isExist`（`hasBlock || hasBlockInfo`）与 `SnapshotStoreImpl.makeSnapshot`
+  （只保留三类区块：余额不为零的、余额被花费过因而记下了公钥的、从更早的快照继承来的）
+- 每次快照升级后，其余的旧区块（包括所有已执行的交易块）被彻底遗忘。把一个旧交易块的原始数据重新广播，
   节点会把它当成新区块。账户交易有 nonce 挡着，不会重复执行；但**从区块余额支付的主交易没有 nonce**，
   只要它的来源区块在快照时还留有不少于当时支付额的余额，就会被再执行一次，把钱再付给原来的收款人一遍。
   每个旧交易块在每次快照升级后可以被重放一次；一次性把来源区块花光的支付（矿池的常规发奖）不受影响，
@@ -126,6 +138,8 @@ xdagj 的历史丢失由三件事共同造成：
 - 位置：`XAmount.toXAmount`（`BasicUtils.xdag2amount(double)`）等
 - nano 与 C 单位之间的换算经过 `double`，存在舍入误差。
 - 处理：共识相关的旧规则换算逐位复现（否则无法与现网一致）；其余部分和 Nova 规则下全部使用整数精确运算。
+- 实例：xdagj 载入主网快照时打印的地址余额合计是 738,692,452.583338452，随后 `stats` 命令显示的是 738,692,452.583338499
+  （合计值存成 C 单位再经 `double` 读回，差了 47 nano）。只影响显示。
 
 ### A2. RPC / 命令行的转账金额被四舍五入到 0.01 XDAG — **已修复**
 
@@ -186,6 +200,13 @@ xdagj 的历史丢失由三件事共同造成：
 | O3 | `BasicUtils.getDiffByHash`（共识难度计算） | 哈希前 96 位全为零时除零抛异常（理论问题，需约 2^96 次哈希） | 该情况下取最大难度 |
 | O4 | `updateBlockFlag` | 手续费非零时静默地从数据库重新读取手续费，依赖调用顺序 | 执行状态与 DAG 元数据分离，不存在此问题 |
 | O5 | `checkMineAndAdd` | 对没有输出签名的区块直接解引用（空指针） | 导入时要求输出签名 |
+| O6 | `Kernel`（创建 `BlockStoreImpl`） | 数据库按 `INDEX, BLOCK, TIME` 传给参数顺序为 `index, time, block` 的构造函数：原始区块存在名为 `TIME` 的目录里，时间索引存在 `BLOCK` 里，为时间索引准备的 RocksDB 前缀配置也落在了错误的库上 | 不适用；导出工具按内容识别 |
+| O7 | `PoolAwardManagerImpl` | 待发的奖励只记在内存里的 16 格环形数组中，节点重启后这 16 个 epoch 内挖到的主块不再发奖 | 保存在 `rewards.json`，重启后继续 |
+| O8 | 发布包 | 0.8.4 自带的 RandomX 库依赖 GCC 13 的 libstdc++（`GLIBCXX_3.4.32`），在 Ubuntu 22.04 上加载失败，节点无法启动 | 不适用（xdagd 从源码编译 RandomX） |
+| O9 | `XdagApiImpl.transferBlockInfoToBlockResultDTO` | 从快照继承的区块，`xdag_getBlockByHash` / `xdag_getBlockByNumber` 只返回余额：高度恒为 0，状态、难度、标志、备注为空，时间一律是快照时间——尽管这些信息都在数据库里 | 返回记录下来的高度、时间、状态、难度和备注（类型仍为 `Snapshot`） |
+
+另外，对一份真实主网快照（高度 4,240,061）的核对中看到了一些账本层面的现象——余额总和比累计出块奖励多 29,839.8 XDAG、
+两个主块余额为负等，列在 [INTEROP.md](INTEROP.md) 的"主网数据里观察到的现象"一节。
 
 ## 七、本实现与 xdagj 行为不同之处（汇总）
 

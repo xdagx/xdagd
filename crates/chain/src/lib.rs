@@ -23,6 +23,7 @@ pub mod records;
 pub mod snapshot;
 pub mod sums;
 pub mod testkit;
+pub mod verify;
 
 pub use chain::{Chain, ChainEvent, ChainOptions, Clock, ImportOutcome, ManualClock, Source, SystemClock};
 pub use evm_api::{EvmAccount, EvmChanges, EvmEngine, EvmEnv, EvmExecResult, EvmStateAccess, EvmTxInfo};

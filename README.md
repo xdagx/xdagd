@@ -14,7 +14,7 @@
 - **智能合约**：内置 EVM（[revm](https://github.com/bluealloy/revm)，Prague 规则），提供 `eth_*` RPC，MetaMask / ethers / Foundry 可直接使用。
 - **更高 TPS**：Nova 批量区块——一个 DAG 区块通过载荷根承载最多 8192 笔交易，签名并行校验、批量落盘。
 
-> 状态：**1.0.0-alpha.1，尚未审计，未接入真实主网验证。** 详见文末"已知限制"。
+> 状态：**1.0.0-alpha.1，尚未审计，尚未接入主网。** 已用真实主网快照在隔离网络上与 xdagj 对接验证，详见文末"已知限制"。
 
 ## 为什么用 Rust 而不是 Go
 
@@ -96,11 +96,12 @@ MetaMask：添加网络，RPC 填 `http://127.0.0.1:30001`，链 ID 用 `xdag_ge
 | `xdagd run` | 运行节点（默认） |
 | `xdagd init [file]` | 输出当前生效配置（TOML） |
 | `xdagd wallet create / list / new-account / restore <助记词>` | 钱包（与 xdagj `wallet.data` v4 互通，密码取自 `XDAG_WALLET_PASSWORD`） |
-| `xdagd snapshot export <file>` / `import <file>` / `info <file>` | XSNP 状态快照：导出本节点的全部状态 / 导入到全新的数据目录 / 查看快照内容与账户摘要 |
+| `xdagd snapshot export <file>` / `import <file>` | XSNP 状态快照：导出本节点的全部状态 / 导入到全新的数据目录 |
+| `xdagd snapshot info <file>` / `diff <a> <b>` / `verify <file>` | 不启动节点检查快照文件：内容与账户摘要 / 逐项比较两份快照的共识状态 / 审计（重算区块哈希、签名、难度（含 RandomX）、主链结构，比较余额合计与出块奖励） |
 | `xdagd archive import-raw <files...>` / `history <地址或区块>` | 导入原始区块归档（xdagj 导出或旧 C 版 `storage/*.dat`）并查询历史 |
 | `xdagd status` | 本地数据库状态 |
 | `xdagd bench [--txs N] [--senders N] [--legacy]` | 在本机测量吞吐 |
-| `xdagd tx ...` | 通过 RPC 签名并发送交易 |
+| `xdagd tx native / evm / legacy / from-block ...` | 通过 RPC 签名并发送交易：Nova 原生转账、EVM 交易，xdagj 区块格式的账户转账（`legacy`）或花费区块余额（`from-block`，相当于 xdagj 的 `xfertonew`）；后两种可以发给 xdagj 节点 |
 
 全局参数：`--config`、`--network mainnet|testnet|devnet`、`--datadir`、`--p2p`、`--rpc`、`--seed`（可重复）、`--mine`、`--threads`。
 
@@ -109,8 +110,8 @@ MetaMask：添加网络，RPC 填 `http://127.0.0.1:30001`，链 ID 用 `xdag_ge
 ```
 crates/
   types     协议基础类型：区块解析/构建、金额、地址、签名、难度、网络参数、Nova 载荷
-  storage   redb 存储：表定义、版本化 schema、迁移、批量写
-  chain     共识核心：导入（tryToConnect）、主链选择、执行与回滚日志、Nova 执行、交易池、快照、归档、查询
+  storage   redb 存储：表定义、版本化 schema、迁移、批量写、大批量导入（外部排序）
+  chain     共识核心：导入（tryToConnect）、主链选择、执行与回滚日志、Nova 执行、交易池、快照（导入导出、比较、审计）、归档、查询
   evm       revm 集成：交易解码/验签、执行、状态差异
   randomx   内置 RandomX v1.2.1（cc 编译，无需 CMake）
   wallet    xdagj wallet.data v4、BIP32/BIP44（m/44'/586'/0'/0/i）
@@ -118,7 +119,8 @@ crates/
   rpc       JSON-RPC：xdag_*（兼容 xdagj）+ eth_* / net_* / web3_*
   pool      矿池 WebSocket 接口（兼容 xdagj）、内置矿工、奖励分配
   node      xdagd 可执行文件：配置、导入流水线、出块、各子命令
-tools/xdagj-exporter   把 xdagj 节点数据导出为 XSNP 快照 + 原始区块归档（Java）
+tools/xdagj-exporter   把 xdagj 节点数据或 xdagj 快照导出为 XSNP 快照 + 原始区块归档（Java）
+tools/interop          与真实 xdagj 节点对接测试用的脚本（沙箱里的双节点、主网快照的离线核对、逐项比对）
 docs/                  设计、Bug 清单、迁移方案、性能测试、RPC 文档
 ```
 
@@ -129,14 +131,18 @@ docs/                  设计、Bug 清单、迁移方案、性能测试、RPC �
 - [docs/MIGRATION.md](docs/MIGRATION.md) —— 主网迁移方案（数据导出、开放网络、Nova 激活）
 - [docs/BENCHMARK.md](docs/BENCHMARK.md) —— TPS 测试方法与结果
 - [docs/RPC.md](docs/RPC.md) —— RPC 接口
+- [docs/INTEROP.md](docs/INTEROP.md) —— 与真实 xdagj 0.8.4 节点的对接测试结果：全新的开发网，以及从真实主网快照开始的隔离网络
+  （复现方法见 `tools/interop/`）
 
 ## 已知限制
 
-- 没有在真实主网数据或与 xdagj 节点的实网互联中验证过（开发环境没有 Java，主网有白名单）。
-  兼容性依据是逐行对照 xdagj 源码移植，以及 xdagj / xdagj-crypto 自带的测试向量。
+- 已经和真实的 xdagj 0.8.4 节点对接验证过两轮（见 [docs/INTEROP.md](docs/INTEROP.md)）：全新的开发网；
+  以及把高度 4,240,061 的真实主网快照导入两个节点、在隔离网络上继续运行。两边的状态逐项相同，
+  xdagd 用主网参数重算的 2,112 个真实主块的 RandomX 难度与主网记录的全部相同。
+  但**还没有连接过主网**：主网的实时数据流、多节点的公网环境、长时间运行都没有验证过。
 - **不能直接从零同步主网**：xdagj 节点只接受白名单内的 IP，而且它们自己是从余额快照启动的，没有更早的区块。
-  接入主网需要先从一台 xdagj 节点导出状态并导入，见 [docs/MIGRATION.md](docs/MIGRATION.md) 阶段 0。
-- `tools/xdagj-exporter` 未编译运行过，迁移前必须在数据副本上演练。
+  接入主网需要先导入一份主网状态，并由 xdagj 节点的运营方把 xdagd 的 IP 加入白名单，见 [docs/MIGRATION.md](docs/MIGRATION.md) 阶段 0。
+- `tools/xdagj-exporter` 在开发网的 xdagj 数据库和官方主网快照上运行并核对过，还没有在长期运行的主网节点的数据库上运行过。
 - Nova 在主网的激活 epoch、链 ID 等参数尚未确定（主网默认不激活）。
 - Nova 激活后所有非候选块（包括交易块）都需要少量反垃圾工作量，xdagj 旧钱包构造的交易块会被拒绝，
   钱包 / 交易所需要在激活前升级（见 [docs/MIGRATION.md](docs/MIGRATION.md) 阶段 3）。

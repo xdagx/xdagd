@@ -65,6 +65,11 @@ pub trait Backend: Send + Sync + 'static {
     fn client_version(&self) -> String;
     /// (hash, sender, nonce, in flight) of pooled Nova transactions.
     fn pending(&self) -> Vec<([u8; 32], Address, u64, bool)>;
+    /// A block by hash. Nodes also answer for the main-block candidates they
+    /// still hold only in memory (as xdagj does).
+    fn block_view(&self, h: &HashLow) -> Result<Option<xdag_chain::query::BlockView>, String> {
+        xdag_chain::query::block_view(self.db(), h).map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug)]

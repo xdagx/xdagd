@@ -10,6 +10,11 @@
  *   2. optionally, every raw block the node has, as concatenated 512-byte
  *      records for `xdagd archive import-raw` (history index).
  *
+ * With --snapshot it converts an xdagj snapshot instead (the SNAPSHOT directory
+ * with its ADDRESS and BLOCKS databases that xdagj nodes are started from with
+ * --enablesnapshot): the result is the state an xdagj node has right after
+ * loading that snapshot.
+ *
  * It runs on xdagj's own classpath, so block metadata is decoded by xdagj's
  * own Kryo setup (BlockStoreImpl); use the exact jar version the node ran.
  *
@@ -17,6 +22,8 @@
  * Run:    java -cp xdagj-0.8.4-executable.jar:out XdagjExporter \
  *              --store ./mainnet/rocksdb/xdagdb --network mainnet \
  *              --out state.xsnp [--blocks blocks.dat]
+ *         java -cp xdagj-0.8.4-executable.jar:out XdagjExporter \
+ *              --snapshot ./SNAPSHOT --height 4240061 --network mainnet --out state.xsnp
  *
  * XSNP layout (format 2): see crates/chain/src/snapshot.rs. All integers
  * little-endian except difficulties (32-byte big-endian). Hashes are converted
@@ -49,6 +56,8 @@ import java.io.OutputStream;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -74,18 +83,24 @@ public final class XdagjExporter {
     private static final int STATUS_UNKNOWN = 0xff;
 
     public static void main(String[] args) throws Exception {
-        String store = null, network = null, out = null, blocksOut = null;
+        String store = null, snapshot = null, network = null, out = null, blocksOut = null;
+        long height = -1;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--store" -> store = args[++i];
+                case "--snapshot" -> snapshot = args[++i];
+                case "--height" -> height = Long.parseLong(args[++i]);
                 case "--network" -> network = args[++i];
                 case "--out" -> out = args[++i];
                 case "--blocks" -> blocksOut = args[++i];
                 default -> usage("unknown argument " + args[i]);
             }
         }
-        if (store == null || network == null || out == null) {
-            usage("--store, --network and --out are required");
+        if ((store == null) == (snapshot == null) || network == null || out == null) {
+            usage("--store or --snapshot, --network and --out are required");
+        }
+        if (snapshot != null && (height <= 0 || blocksOut != null)) {
+            usage("--snapshot needs --height (the main height the snapshot was taken at) and has no raw blocks to dump");
         }
         int networkId = switch (network) {
             case "mainnet" -> 0;
@@ -95,15 +110,32 @@ public final class XdagjExporter {
         };
 
         RocksDB.loadLibrary();
+        if (snapshot != null) {
+            try (Options opts = new Options().setCreateIfMissing(false);
+                 RocksDB blocks = open(opts, snapshot, "BLOCKS");
+                 RocksDB address = open(opts, snapshot, "ADDRESS")) {
+                BlockStoreImpl blockStore = new BlockStoreImpl(new ReadOnlySource("BLOCKS", blocks), new ReadOnlySource("time index", null),
+                        new ReadOnlySource("raw blocks", null), new ReadOnlySource("TXHISTORY", null));
+                new XdagjExporter(networkId, blockStore, blocks, null, address, height).run(new File(out));
+            }
+            return;
+        }
         try (Options opts = new Options().setCreateIfMissing(false);
              RocksDB index = open(opts, store, "INDEX");
-             RocksDB block = open(opts, store, "BLOCK");
+             RocksDB dirTime = open(opts, store, "TIME");
+             RocksDB dirBlock = open(opts, store, "BLOCK");
              RocksDB address = open(opts, store, "ADDRESS")) {
+            // xdagj 0.8.4 passes its databases to BlockStoreImpl in swapped order
+            // (Kernel: INDEX, BLOCK, TIME for the parameters index, time, block), so
+            // the raw blocks live in the directory called TIME and the time index
+            // in BLOCK. Find the raw blocks by their shape instead of by name.
+            RocksDB block = holdsRawBlocks(dirTime) ? dirTime : holdsRawBlocks(dirBlock) ? dirBlock : dirTime;
+            System.out.println("raw blocks are read from the " + (block == dirTime ? "TIME" : "BLOCK") + " directory");
             ReadOnlySource indexSrc = new ReadOnlySource("INDEX", index);
-            ReadOnlySource blockSrc = new ReadOnlySource("BLOCK", block);
-            BlockStoreImpl blockStore = new BlockStoreImpl(indexSrc, new ReadOnlySource("TIME", null), blockSrc,
+            ReadOnlySource blockSrc = new ReadOnlySource("raw blocks", block);
+            BlockStoreImpl blockStore = new BlockStoreImpl(indexSrc, new ReadOnlySource("time index", null), blockSrc,
                     new ReadOnlySource("TXHISTORY", null));
-            new XdagjExporter(networkId, blockStore, index, block, address).run(new File(out));
+            new XdagjExporter(networkId, blockStore, index, block, address, -1).run(new File(out));
             if (blocksOut != null) {
                 dumpRawBlocks(block, new File(blocksOut));
             }
@@ -114,7 +146,17 @@ public final class XdagjExporter {
         System.err.println(msg);
         System.err.println("usage: XdagjExporter --store <xdagj rocksdb/xdagdb dir> --network mainnet|testnet|devnet"
                 + " --out <state.xsnp> [--blocks <blocks.dat>]");
+        System.err.println("       XdagjExporter --snapshot <xdagj SNAPSHOT dir> --height <main height> --network mainnet|testnet|devnet"
+                + " --out <state.xsnp>");
         System.exit(2);
+    }
+
+    /** Raw blocks are stored as 32-byte hashlow -> 512 bytes. */
+    private static boolean holdsRawBlocks(RocksDB db) {
+        try (RocksIterator it = db.newIterator()) {
+            it.seekToFirst();
+            return it.isValid() && it.key().length == 32 && it.value().length == 512;
+        }
     }
 
     private static RocksDB open(Options opts, String store, String name) throws RocksDBException {
@@ -131,40 +173,85 @@ public final class XdagjExporter {
     private final int networkId;
     private final BlockStoreImpl blockStore;
     private final RocksDB index;
+    /** Raw blocks; null when converting a snapshot (which has none). */
     private final RocksDB block;
     private final RocksDB address;
+    /** Main height of the snapshot being converted, or -1 for a node's store. */
+    private final long snapshotHeight;
 
-    private XdagjExporter(int networkId, BlockStoreImpl blockStore, RocksDB index, RocksDB block, RocksDB address) {
+    private XdagjExporter(int networkId, BlockStoreImpl blockStore, RocksDB index, RocksDB block, RocksDB address, long snapshotHeight) {
         this.networkId = networkId;
         this.blockStore = blockStore;
         this.index = index;
         this.block = block;
         this.address = address;
+        this.snapshotHeight = snapshotHeight;
     }
 
     private void run(File out) throws Exception {
-        XdagStats stats = blockStore.getXdagStatus();
-        XdagTopStatus topStatus = blockStore.getXdagTopStatus();
-        if (stats == null) {
-            throw new IllegalStateException("no chain statistics in the INDEX database");
-        }
-        long nmain = stats.nmain;
-
-        // pass 1: main-chain index from the block metadata itself (xdagj's
-        // height keys are not cleaned up after reorganisations)
-        TreeMap<Long, byte[]> mains = new TreeMap<>();
-        forEachPrefix(index, new byte[]{HASH_BLOCK_INFO}, (k, v) -> {
-            BlockInfo bi = info(k);
-            if (bi != null && (bi.getFlags() & BI_MAIN) != 0 && bi.getHeight() > 0 && bi.getHeight() <= nmain) {
-                mains.put(bi.getHeight(), wireHashlow(bi.getHashlow()));
+        boolean fromSnapshot = snapshotHeight > 0;
+        XdagTopStatus topStatus = null;
+        long nmain;
+        if (fromSnapshot) {
+            // a snapshot carries no chain statistics: xdagj takes the height from its command line
+            nmain = snapshotHeight;
+        } else {
+            XdagStats stats = blockStore.getXdagStatus();
+            topStatus = blockStore.getXdagTopStatus();
+            if (stats == null) {
+                throw new IllegalStateException("no chain statistics in the INDEX database");
             }
-        });
-        if (!mains.containsKey(nmain)) {
+            nmain = stats.nmain;
+        }
+        if (nmain >= Integer.MAX_VALUE / 24) {
+            throw new IllegalStateException("main height " + nmain + " is out of range");
+        }
+
+        // One pass over the block metadata: every block goes to a temporary file
+        // (the count comes first in the snapshot), and the main-chain index is
+        // taken from the metadata itself (xdagj's height keys are not cleaned
+        // up after reorganisations).
+        byte[] mains = new byte[(int) (nmain + 1) * 24];
+        BitSet haveMain = new BitSet((int) nmain + 1);
+        File tmp = new File(out.getPath() + ".blocks.tmp");
+        long[] counts = new long[3]; // total, with data, metadata only
+        BigInteger[] blockSum = {BigInteger.ZERO};
+        try (OutputStream bo = new BufferedOutputStream(new FileOutputStream(tmp), 1 << 20)) {
+            Le w = new Le(bo);
+            forEachPrefix(index, new byte[]{HASH_BLOCK_INFO}, (k, v) -> {
+                BlockInfo bi = info(k);
+                if (bi == null) {
+                    return;
+                }
+                if ((bi.getFlags() & BI_MAIN) != 0 && bi.getHeight() > 0) {
+                    long h = bi.getHeight();
+                    if (h > nmain) {
+                        if (fromSnapshot) {
+                            throw new IllegalStateException("main block " + h + " is above the given snapshot height " + nmain);
+                        }
+                    } else {
+                        byte[] hl = wireHashlow(bi.getHashlow());
+                        if (haveMain.get((int) h) && !Arrays.equals(hl, Arrays.copyOfRange(mains, (int) h * 24, (int) h * 24 + 24))) {
+                            throw new IllegalStateException("two main blocks claim height " + h);
+                        }
+                        haveMain.set((int) h);
+                        System.arraycopy(hl, 0, mains, (int) h * 24, 24);
+                    }
+                }
+                blockSum[0] = blockSum[0].add(BigInteger.valueOf(nano(bi.getAmount())));
+                try {
+                    writeBlock(w, bi, counts);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+        if (!haveMain.get((int) nmain)) {
             throw new IllegalStateException("main block " + nmain + " (the top of the main chain) is missing");
         }
 
         // top: xdagj's top block if it was saved, else the last main block
-        byte[] top = mains.get(nmain);
+        byte[] top = Arrays.copyOfRange(mains, (int) nmain * 24, (int) nmain * 24 + 24);
         BigInteger topDiff = null;
         if (topStatus != null && topStatus.getTop() != null) {
             BlockInfo ti = blockStore.getBlockInfo(Bytes32.wrap(topStatus.getTop()));
@@ -177,29 +264,25 @@ public final class XdagjExporter {
             topDiff = infoByWire(top).getDifficulty();
         }
 
-        // pass 2: blocks, into a temporary file (the count comes first)
-        File tmp = new File(out.getPath() + ".blocks.tmp");
-        long[] counts = new long[3]; // total, with data, metadata only
-        try (OutputStream bo = new BufferedOutputStream(new FileOutputStream(tmp), 1 << 20)) {
-            Le w = new Le(bo);
-            forEachPrefix(index, new byte[]{HASH_BLOCK_INFO}, (k, v) -> {
-                BlockInfo bi = info(k);
-                if (bi == null) {
-                    return;
-                }
-                try {
-                    writeBlock(w, bi, counts);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            });
-        }
-
         // accounts
         Map<String, long[]> accounts = new TreeMap<>();
+        BigInteger[] accountSum = {BigInteger.ZERO};
+        long[] adjusted = new long[1];
         forEachPrefix(address, new byte[]{ADDRESS}, (k, v) -> {
             if (k.length == 21 && v != null && v.length == 8) {
-                accounts.computeIfAbsent(hex(k, 1, 21), x -> new long[2])[0] = beLong(v);
+                long units = beLong(v);
+                if (fromSnapshot) {
+                    // xdagj loads a snapshot balance through its nano representation
+                    // (SnapshotStoreImpl.saveAddress → AddressStoreImpl.snapshotAddress)
+                    XAmount loaded = XAmount.ofXAmount(units);
+                    long stored = loaded.toXAmount().toLong();
+                    if (stored != units) {
+                        adjusted[0]++;
+                    }
+                    units = stored;
+                }
+                accountSum[0] = accountSum[0].add(BigInteger.valueOf(nano(XAmount.ofXAmount(units))));
+                accounts.computeIfAbsent(hex(k, 1, 21), x -> new long[2])[0] = units;
             }
         });
         forEachPrefix(address, new byte[]{EXECUTED_NONCE_NUM}, (k, v) -> {
@@ -208,6 +291,7 @@ public final class XdagjExporter {
             }
         });
 
+        long mainEntries = haveMain.cardinality();
         try (OutputStream os = new BufferedOutputStream(new FileOutputStream(out), 1 << 20)) {
             Le w = new Le(os);
             w.bytes(new byte[]{'X', 'S', 'N', 'P'});
@@ -229,19 +313,24 @@ public final class XdagjExporter {
             try (InputStream in = new BufferedInputStream(new FileInputStream(tmp), 1 << 20)) {
                 in.transferTo(os);
             }
-            w.u64(mains.size());
-            for (Map.Entry<Long, byte[]> e : mains.entrySet()) {
-                w.u64(e.getKey());
-                w.bytes(e.getValue());
+            w.u64(mainEntries);
+            for (int h = haveMain.nextSetBit(0); h >= 0; h = haveMain.nextSetBit(h + 1)) {
+                w.u64(h);
+                os.write(mains, h * 24, 24);
             }
             w.u8(0); // no execution-record tables
         }
         Files.delete(tmp.toPath());
         System.out.printf("snapshot: main height %d, %d accounts, %d blocks (%d with data, %d metadata only), %d main-chain entries%n",
-                nmain, accounts.size(), counts[0], counts[1], counts[2], mains.size());
-        if (mains.size() != nmain) {
-            System.out.printf("note: %d main blocks below the node's own snapshot height are not stored by xdagj%n",
-                    nmain - mains.size());
+                nmain, accounts.size(), counts[0], counts[1], counts[2], mainEntries);
+        System.out.printf("amount in address: %s, amount in blocks: %s, all amount: %s%n", xdag(accountSum[0]), xdag(blockSum[0]),
+                xdag(accountSum[0].add(blockSum[0])));
+        if (fromSnapshot && adjusted[0] > 0) {
+            System.out.printf("note: %d account balances change in their last digits when xdagj loads this snapshot; the loaded values are exported%n",
+                    adjusted[0]);
+        }
+        if (mainEntries != nmain) {
+            System.out.printf("note: %d main blocks below the node's own snapshot height are not stored by xdagj%n", nmain - mainEntries);
         }
     }
 
@@ -256,9 +345,14 @@ public final class XdagjExporter {
         if (javaHashlow == null || javaHashlow.length != 32) {
             throw new IllegalStateException("block info without a hashlow");
         }
-        byte[] raw = get(block, javaHashlow);
+        byte[] raw = block == null ? null : get(block, javaHashlow);
         if (raw != null && raw.length != 512) {
             raw = null;
+        }
+        if (raw == null && !bi.isSnapshot()) {
+            // only blocks inherited from xdagj's own snapshot lack their data
+            throw new IllegalStateException("block " + hex(javaHashlow, 8, 32) + " has neither data nor snapshot information:"
+                    + " the store is incomplete or is not laid out as this tool expects");
         }
         int kind;
         byte[] data;
@@ -361,6 +455,10 @@ public final class XdagjExporter {
 
     private static long nano(XAmount a) {
         return a == null ? 0 : a.toDecimal(0, XUnit.NANO_XDAG).longValueExact();
+    }
+
+    private static String xdag(BigInteger nano) {
+        return new java.math.BigDecimal(nano).movePointLeft(9).toPlainString();
     }
 
     private static byte[] be32(BigInteger v) {

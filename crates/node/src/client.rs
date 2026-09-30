@@ -56,6 +56,76 @@ pub fn load_key(spec: &str) -> Result<KeyPair> {
     KeyPair::from_secret_bytes(&b).map_err(|e| anyhow!("{e}"))
 }
 
+/// What a transaction in xdagj's block format needs to know of the node it
+/// is sent to: the network's parameters and a block time inside the epoch.
+fn legacy_template(url: &str, remark: &str) -> Result<(xdag_types::NetworkParams, xdag_types::BlockTemplate)> {
+    use xdag_types::{BlockTemplate, Network, NetworkParams};
+    anyhow::ensure!(remark.len() <= 32, "remark longer than 32 bytes");
+    let network = match rpc(url, "xdag_netType", json!([]))?.as_str() {
+        Some("mainnet") => Network::Mainnet,
+        Some("testnet") => Network::Testnet,
+        Some("devnet") => Network::Devnet,
+        other => bail!("unknown network type {other:?}"),
+    };
+    let params = NetworkParams::for_network(network);
+    let now = xdag_types::time::now_xdag();
+    let time = if params.epochs().is_end_of_epoch(now) { now - 1 } else { now };
+    let mut t = BlockTemplate::new(params.header_field(), time);
+    if !remark.is_empty() {
+        let mut r = [0u8; 32];
+        r[..remark.len()].copy_from_slice(remark.as_bytes());
+        t.remark = Some(r);
+    }
+    Ok((params, t))
+}
+
+/// A legacy account transaction in xdagj's block format, for networks still
+/// on xdagj's rules (any xdagj or xdagd node accepts it). The receiver gets
+/// `amount`; the sender also pays the 0.1 XDAG output fee. No balance check
+/// is made here: the network decides.
+pub fn send_legacy(url: &str, key: &KeyPair, to: &str, amount: &str, nonce: Option<u64>, remark: &str) -> Result<String> {
+    use xdag_types::{FieldType, LinkTarget};
+    let to = Address::parse(to).map_err(|_| anyhow!("bad destination"))?;
+    let amount = Nano::parse_xdag(amount).map_err(|e| anyhow!("amount: {e}"))?;
+    let (params, mut t) = legacy_template(url, remark)?;
+    let nonce = match nonce {
+        Some(n) => n,
+        None => rpc(url, "xdag_getTransactionNonce", json!([key.address().to_base58()]))?
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow!("bad nonce"))?,
+    };
+    let total = amount.checked_add(params.min_gas).ok_or_else(|| anyhow!("amount overflow"))?.to_camount_legacy();
+    t.tx_nonce = Some(nonce);
+    t.links.push((FieldType::Input, LinkTarget::Address(key.address()), total));
+    t.links.push((FieldType::Output, LinkTarget::Address(to), total));
+    t.sign_out = Some(key.clone());
+    t.include_out_pubkey = true;
+    let block = t.build().map_err(|e| anyhow!("{e}"))?;
+    let r = rpc(url, "xdag_sendRawTransaction", json!([hex::encode(block.raw())]))?;
+    Ok(format!("{}  (block {}, nonce {nonce})", r.as_str().unwrap_or_default(), block.hashlow().to_legacy_address()))
+}
+
+/// Spend the balance of a block — the reward of a block this key mined, or a
+/// balance from before account addresses existed — in xdagj's block format
+/// (what xdagj's `xfertonew` sends). `amount` leaves the block; the receiver
+/// gets it less the 0.1 XDAG output fee. Only the key that signed the block
+/// can spend it, and no check is made here: the network decides.
+pub fn send_from_block(url: &str, key: &KeyPair, block: &str, to: &str, amount: &str, remark: &str) -> Result<String> {
+    use xdag_types::{FieldType, HashLow, LinkTarget};
+    let from = HashLow::from_legacy_address(block).map_err(|_| anyhow!("bad block address"))?;
+    let to = Address::parse(to).map_err(|_| anyhow!("bad destination"))?;
+    let amount = Nano::parse_xdag(amount).map_err(|e| anyhow!("amount: {e}"))?.to_camount_legacy();
+    let (_, mut t) = legacy_template(url, remark)?;
+    t.links.push((FieldType::In, LinkTarget::Block(from), amount));
+    t.links.push((FieldType::Output, LinkTarget::Address(to), amount));
+    t.sign_out = Some(key.clone());
+    t.include_out_pubkey = true;
+    let tx = t.build().map_err(|e| anyhow!("{e}"))?;
+    let r = rpc(url, "xdag_sendRawTransaction", json!([hex::encode(tx.raw())]))?;
+    Ok(format!("{}  (block {})", r.as_str().unwrap_or_default(), tx.hashlow().to_legacy_address()))
+}
+
 fn chain_info(url: &str) -> Result<(u64, Nano)> {
     let info = rpc(url, "xdag_getChainInfo", json!([]))?;
     let chain_id = info["chainId"].as_u64().ok_or_else(|| anyhow!("this network has no Nova parameters"))?;

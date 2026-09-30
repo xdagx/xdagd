@@ -9,7 +9,7 @@ use std::sync::Arc;
 use common::*;
 use xdag_chain::records::{flags, AccountRecord, Balance, BlockInfo, BlockState, SnapshotKey};
 use xdag_chain::snapshot::{self, SnapshotBlock, SnapshotData, SnapshotHeader, SnapshotReader, SnapshotWriter};
-use xdag_chain::ImportOutcome;
+use xdag_chain::{verify, ImportOutcome};
 use xdag_storage::{Db, Table};
 use xdag_types::nova::{NativeTransfer, NovaTx};
 use xdag_types::{Address, HashLow, KeyPair, Nano};
@@ -369,6 +369,42 @@ fn randomx_schedule_is_rebuilt_from_the_main_chain() {
     assert!(snapshot::import(&mut d.chain, &mut &write(&parsed)[..]).is_err());
 }
 
+/// An xdagj node that was started from a snapshot counts the RandomX fork
+/// from the last seed height at or below its snapshot height and scores older
+/// candidates by sha256d. A node taking over its state draws the same line.
+#[test]
+fn the_randomx_fork_line_follows_the_exporters_own_snapshot() {
+    let mut p = legacy_params();
+    p.randomx.fork_height = 8;
+    p.randomx.seed_epoch_blocks = 4;
+    p.randomx.seed_lag = 2;
+    let mut a = Sim::new(p);
+    a.mine_n(23);
+    let want = a.chain.rx_schedule().clone();
+
+    // as exported from an xdagj node that started from a snapshot at height
+    // 18: the main blocks up to there come without their data
+    let mut parsed = parse(&export(&mut a));
+    parsed.header.rx = None;
+    let pubkey = a.miner.public().serialize();
+    for blk in parsed.blocks.iter_mut() {
+        if blk.flags & flags::MAIN != 0 && blk.height <= 18 {
+            blk.data = SnapshotData::Key(SnapshotKey::PublicKey(pubkey));
+        }
+    }
+    let mut b = node_from(&a, &write(&parsed));
+    let got = b.chain.rx_schedule().clone();
+    let seed_block = a.chain.main_at(16).unwrap().unwrap();
+    let seed_time = a.chain.info(&seed_block).unwrap().unwrap().time;
+    assert_eq!(got.fork_epoch, Some(a.epochs().epoch(seed_time) + 2));
+    assert!(got.fork_epoch > want.fork_epoch);
+    assert!(got.seeds.iter().rev().take(2).eq(want.seeds.iter().rev().take(2)));
+
+    // and keeps it through a snapshot of its own
+    let c = bootstrap(&mut b);
+    assert_eq!(c.chain.rx_schedule().fork_epoch, got.fork_epoch);
+}
+
 #[test]
 fn a_failed_import_cannot_be_opened_as_a_chain() {
     let mut a = Sim::new(legacy_params());
@@ -446,9 +482,15 @@ fn the_layout_written_by_the_xdagj_exporter_imports() {
     a.mine(&[pay.hashlow()]);
     a.mine_n(2);
     let tx = a.transfer(&alice, KeyPair::random().address(), Nano::from_xdag(10), 1, 200);
-    assert!(a.import(&tx).is_imported());
-    a.mine(&[tx.hashlow()]);
+    // one transfer too large (rejected) and one beyond a nonce gap (skipped)
+    let rejected = a.transfer(&alice, KeyPair::random().address(), Nano::from_xdag(5000), 2, 201);
+    let skipped = a.transfer(&alice, KeyPair::random().address(), Nano::from_xdag(1), 9, 202);
+    for b in [&tx, &rejected, &skipped] {
+        assert!(a.import(b).is_imported());
+    }
+    a.mine(&[tx.hashlow(), rejected.hashlow(), skipped.hashlow()]);
     a.mine_n(3);
+    assert_eq!(a.account(&alice.address()).unwrap().nonce, 2);
     a.chain.commit(true).unwrap();
     let db = a.chain.db().clone();
     let nmain = a.chain.nmain();
@@ -550,4 +592,158 @@ fn describing_a_snapshot_gives_counts_supply_and_a_stable_account_digest() {
     a.mine(&[tx.hashlow()]);
     a.mine_n(2);
     assert_ne!(snapshot::describe(&export(&mut a)[..]).unwrap().accounts_digest, s1.accounts_digest);
+}
+
+#[test]
+fn diff_reports_state_differences_and_ignores_node_local_marks() {
+    let mut a = Sim::new(legacy_params());
+    let mains = a.mine_n(4);
+    let alice = KeyPair::random();
+    let pay = a.payout(mains[0], alice.address(), Nano::from_xdag(100));
+    assert!(a.import(&pay).is_imported());
+    a.mine(&[pay.hashlow()]);
+    a.mine_n(3);
+    let bytes = export(&mut a);
+    assert_eq!(snapshot::diff(|| Ok(&bytes[..]), &bytes[..]).unwrap().state_differences, 0);
+
+    // the same state as another node would export it: its own our-block
+    // marks, no transaction statuses, no RandomX schedule
+    let mut other = parse(&bytes);
+    other.header.rx = None;
+    for b in other.blocks.iter_mut() {
+        b.status = snapshot::STATUS_UNKNOWN;
+        b.flags |= flags::OURS;
+    }
+    let other = write(&other);
+    let d = snapshot::diff(|| Ok(&other[..]), &bytes[..]).unwrap();
+    assert_eq!((d.state_differences, d.only_in_first, d.only_in_second), (0, 0, 0), "{:?}", d.lines);
+
+    // a different nonce, a different block balance and a missing block
+    let mut changed = parse(&bytes);
+    changed.accounts[0].1.nonce += 1;
+    changed.blocks[0].amount += 1;
+    changed.blocks.pop();
+    let changed = write(&changed);
+    let d = snapshot::diff(|| Ok(&changed[..]), &bytes[..]).unwrap();
+    assert_eq!((d.state_differences, d.only_in_first, d.only_in_second), (2, 0, 1), "{:?}", d.lines);
+    assert!(d.lines.iter().any(|l| l.starts_with("account ")) && d.lines.iter().any(|l| l.contains("balance")));
+}
+
+/// Stand-in for RandomX: a hash that depends on the seed.
+struct SeededHash;
+
+impl xdag_chain::pow::PowEngine for SeededHash {
+    fn randomx(&self, key: &[u8; 32], input: &[u8; 64]) -> Option<[u8; 32]> {
+        Some(xdag_types::hash::sha256(&[&key[..], &input[..]].concat()))
+    }
+}
+
+fn audit(bytes: &[u8], p: &xdag_types::NetworkParams, pow: &dyn xdag_chain::pow::PowEngine) -> verify::VerifyReport {
+    verify::verify(|| Ok(bytes), p, pow, None, &verify::VerifyOptions::default()).unwrap()
+}
+
+#[test]
+fn verifying_a_snapshot_recomputes_what_it_records() {
+    let mut p = legacy_params();
+    p.randomx.fork_height = 8;
+    p.randomx.seed_epoch_blocks = 4;
+    p.randomx.seed_lag = 2;
+    let mut a = Sim::with_pow(p.clone(), Arc::new(SeededHash));
+    let mains = a.mine_n(6);
+    let alice = KeyPair::random();
+    let pay = a.payout(mains[0], alice.address(), Nano::from_xdag(100));
+    assert!(a.import(&pay).is_imported());
+    a.mine(&[pay.hashlow()]);
+    a.mine_n(2);
+    let tx = a.transfer(&alice, KeyPair::random().address(), Nano::from_xdag(10), 1, 200);
+    assert!(a.import(&tx).is_imported());
+    a.mine(&[tx.hashlow()]);
+    a.mine_n(13);
+    assert!(a.chain.rx_schedule().seeds.len() >= 3, "the chain spans several seeds");
+    let bytes = export(&mut a);
+
+    let report = audit(&bytes, &p, &SeededHash);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let text = report.lines.join("\n");
+    assert!(text.contains("difference +0.000000000"), "{text}");
+    assert!(text.contains(", 0 wrong; not checkable: 0 (no link recorded), 0 (path leaves the file)"), "{text}");
+    assert!(text.contains("1 account transactions, 0 problems"), "{text}");
+
+    // the candidates after the fork were hashed under the seed of their epoch:
+    // any other proof of work, or another seed, gives other difficulties
+    let other = audit(&bytes, &p, &xdag_chain::pow::NoRandomX);
+    assert!(other.failures > 5, "{:#?}", other.lines);
+    let mut shifted = p.clone();
+    shifted.randomx.seed_lag = 1;
+    assert!(audit(&bytes, &shifted, &SeededHash).failures > 5);
+
+    // as an xdagj node exports the state it inherited: early blocks without
+    // their data. Less can be checked, nothing is wrong.
+    let mut inherited = parse(&bytes);
+    inherited.header.rx = None;
+    let pubkey = a.miner.public().serialize();
+    for blk in inherited.blocks.iter_mut() {
+        if blk.flags & flags::MAIN != 0 && blk.height <= 12 {
+            blk.data = SnapshotData::Key(SnapshotKey::PublicKey(pubkey));
+        }
+    }
+    let report = audit(&write(&inherited), &p, &SeededHash);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+
+    // what the audit catches
+    let changed = |change: &dyn Fn(&mut Parsed)| {
+        let mut x = parse(&bytes);
+        change(&mut x);
+        audit(&write(&x), &p, &SeededHash)
+    };
+    let failures = |change: &dyn Fn(&mut Parsed)| changed(change).failures;
+    let at = |x: &Parsed, h: &HashLow| x.blocks.iter().position(|b| b.hashlow == *h).unwrap();
+    assert!(
+        failures(&|x| {
+            let i = at(x, &mains[3]);
+            x.blocks[i].difficulty += xdag_types::U256::from(1u8)
+        }) > 0,
+        "a difficulty that does not follow"
+    );
+    assert!(
+        failures(&|x| {
+            let i = at(x, &mains[3]);
+            x.blocks[i].max_diff_link = Some(mains[1])
+        }) > 0,
+        "another max-difficulty link"
+    );
+    assert!(
+        failures(&|x| {
+            let i = at(x, &mains[3]);
+            x.blocks[i].time += 1
+        }) > 0,
+        "a time that is not the block's"
+    );
+    assert!(
+        failures(&|x| {
+            let i = at(x, &mains[3]);
+            if let SnapshotData::Full { raw, .. } = &mut x.blocks[i].data {
+                raw[100] ^= 1;
+            }
+        }) > 0,
+        "data that is not the block's"
+    );
+    assert!(failures(&|x| (x.mains[2].1, x.mains[3].1) = (x.mains[3].1, x.mains[2].1)) > 0, "a main-chain index that is not a chain");
+    let forged = changed(&|x| {
+        // the same transfer out of alice's account, signed by somebody else
+        let i = at(x, &tx.hashlow());
+        let mallory = KeyPair::random();
+        let amount = Nano::from_xdag(10).to_camount_legacy();
+        let mut t = xdag_types::BlockTemplate::new(a.params.header_field(), x.blocks[i].time);
+        t.tx_nonce = Some(1);
+        t.links.push((xdag_types::FieldType::Input, xdag_types::LinkTarget::Address(alice.address()), amount));
+        t.links.push((xdag_types::FieldType::Output, xdag_types::LinkTarget::Address(mallory.address()), amount));
+        t.sign_out = Some(mallory);
+        t.include_out_pubkey = true;
+        let forged = xdag_chain::builder::seal_template(&a.params, t).unwrap();
+        x.blocks[i].hashlow = forged.hashlow();
+        x.blocks[i].hash = forged.hash();
+        x.blocks[i].data = SnapshotData::Full { raw: Box::new(*forged.raw()), payload: None };
+    });
+    assert!(forged.lines.iter().any(|l| l.contains("not signed by the account it spends")), "{:#?}", forged.lines);
 }

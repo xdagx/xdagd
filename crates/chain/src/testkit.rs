@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::pow::NoRandomX;
+use crate::pow::{NoRandomX, PowEngine};
 use crate::records::AccountRecord;
 use crate::{preverify, Chain, ChainOptions, EvmEngine, ImportOutcome, ManualClock, Source};
 use xdag_storage::{Db, TempDirGuard};
@@ -43,20 +43,26 @@ impl Sim {
     }
 
     pub fn with_db(params: NetworkParams, db: Db, guard: TempDirGuard) -> Sim {
-        Self::build(params, db, guard, None)
+        Self::build(params, db, guard, None, Arc::new(NoRandomX))
     }
 
     pub fn with_evm(params: NetworkParams, evm: Arc<dyn EvmEngine>) -> Sim {
         let (db, guard) = Db::open_temporary().unwrap();
-        Self::build(params, db, guard, Some(evm))
+        Self::build(params, db, guard, Some(evm), Arc::new(NoRandomX))
     }
 
-    fn build(params: NetworkParams, db: Db, guard: TempDirGuard, evm: Option<Arc<dyn EvmEngine>>) -> Sim {
+    /// A node with a RandomX implementation (tests use a stand-in).
+    pub fn with_pow(params: NetworkParams, pow: Arc<dyn PowEngine>) -> Sim {
+        let (db, guard) = Db::open_temporary().unwrap();
+        Self::build(params, db, guard, None, pow)
+    }
+
+    fn build(params: NetworkParams, db: Db, guard: TempDirGuard, evm: Option<Arc<dyn EvmEngine>>, pow: Arc<dyn PowEngine>) -> Sim {
         let epochs = params.epochs();
         let start_epoch = epochs.epoch(params.era) + 10;
         let clock = ManualClock::new(epochs.start_of_epoch(start_epoch));
         let opts = ChainOptions { check_future: false, ..ChainOptions::default() };
-        let chain = Chain::open(db, params.clone(), opts, Arc::new(NoRandomX), evm.clone(), clock.clone()).unwrap();
+        let chain = Chain::open(db, params.clone(), opts, pow, evm.clone(), clock.clone()).unwrap();
         Sim { chain, clock, params, miner: KeyPair::random(), epoch: start_epoch, last_main: None, evm, _guard: guard }
     }
 
