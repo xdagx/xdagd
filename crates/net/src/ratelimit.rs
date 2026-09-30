@@ -39,6 +39,15 @@ pub struct PeerLimits {
     pub peers: Bucket,
 }
 
+impl PeerLimits {
+    /// For peers the operator configured (seeds, allow list): what they send
+    /// was asked for or is wanted, however fast it comes.
+    pub fn unlimited() -> Self {
+        let open = || Bucket::new(1e12, 1e12);
+        PeerLimits { blocks: open(), requests: open(), ranges: open(), txs: open(), peers: open() }
+    }
+}
+
 impl Default for PeerLimits {
     fn default() -> Self {
         PeerLimits {

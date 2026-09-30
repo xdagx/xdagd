@@ -286,10 +286,8 @@ pub struct ChainMeta {
     /// Total stored blocks.
     pub nblocks: u64,
     /// Height of the snapshot the chain was bootstrapped from (0 = genesis sync).
+    /// Main blocks up to it are final: their undo journals do not exist.
     pub snapshot_height: u64,
-    /// Blocks older than this (xdag time) predate the snapshot: they were
-    /// processed before it and must never be applied again.
-    pub snapshot_time: u64,
 }
 
 impl ChainMeta {
@@ -302,8 +300,7 @@ impl ChainMeta {
             .opt_fixed(self.top.as_ref().map(|h| &h.0[..]))
             .fixed(&self.top_diff.to_be_bytes::<32>())
             .u64(self.nblocks)
-            .u64(self.snapshot_height)
-            .u64(self.snapshot_time);
+            .u64(self.snapshot_height);
         w.finish()
     }
 
@@ -320,7 +317,6 @@ impl ChainMeta {
             top_diff: U256::from_be_bytes(r.fixed::<32>().map_err(&e)?),
             nblocks: r.u64().map_err(&e)?,
             snapshot_height: r.u64().map_err(&e)?,
-            snapshot_time: if r.remaining() >= 8 { r.u64().map_err(&e)? } else { 0 },
         })
     }
 }
@@ -475,7 +471,7 @@ mod tests {
         assert_eq!(BlockState::decode(&st.encode()).unwrap(), st);
         let a = AccountRecord { balance: Balance::Wei(10), nonce: 3, pending_nonce: 4, code_hash: Some([9u8; 32]) };
         assert_eq!(AccountRecord::decode(&a.encode()).unwrap(), a);
-        let m = ChainMeta { nmain: 5, top: Some(HashLow([7u8; 24])), top_diff: U256::from(77u8), nblocks: 9, snapshot_height: 0, snapshot_time: 3 };
+        let m = ChainMeta { nmain: 5, top: Some(HashLow([7u8; 24])), top_diff: U256::from(77u8), nblocks: 9, snapshot_height: 4 };
         assert_eq!(ChainMeta::decode(&m.encode()).unwrap(), m);
         let h = HistoryEntry {
             tx: vec![1; 24],

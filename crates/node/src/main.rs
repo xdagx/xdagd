@@ -141,8 +141,12 @@ enum WalletCmd {
 
 #[derive(Subcommand, Debug)]
 enum SnapshotCmd {
+    /// Write everything this node knows to a snapshot file.
     Export { file: PathBuf },
+    /// Load a snapshot into a new (empty) data directory.
     Import { file: PathBuf },
+    /// Describe a snapshot file without importing it.
+    Info { file: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -243,8 +247,8 @@ fn build_node(cfg: NodeConfig) -> Result<Arc<Node>> {
         our_keys.extend(w.accounts.iter().map(|k| *k.public()));
     }
     let opts = ChainOptions { our_keys, ..ChainOptions::default() };
-    let chain =
-        Chain::open(db.clone(), params.clone(), opts, pow.clone(), evm.clone(), Arc::new(SystemClock)).map_err(|e| anyhow!("open chain: {e}"))?;
+    let chain = Chain::open(db.clone(), params.clone(), opts, pow.clone(), evm.clone(), Arc::new(SystemClock))
+        .map_err(|e| anyhow!("open chain: {e} (database: {})", cfg.db_path().display()))?;
     Ok(Node::new(cfg, params, db, chain, key, wallet, evm, pow, rx_engine))
 }
 
@@ -275,6 +279,7 @@ async fn run(cfg: NodeConfig) -> Result<()> {
         max_inbound_per_ip: cfg.p2p.max_inbound_per_ip,
         allow_private: cfg.p2p.allow_private,
         deny: cfg.p2p.deny.clone(),
+        allow: cfg.p2p.allow.iter().copied().filter(|ip| !ip.is_unspecified()).collect(),
         peers_file: Some(cfg.datadir.join("peers.json")),
         ..xdag_net::NetConfig::default()
     };
@@ -376,9 +381,13 @@ fn wallet_cmd(cfg: &NodeConfig, cmd: WalletCmd) -> Result<()> {
 }
 
 fn snapshot_cmd(cfg: &NodeConfig, cmd: SnapshotCmd) -> Result<()> {
+    if let SnapshotCmd::Info { file } = &cmd {
+        return snapshot_info(file);
+    }
     let node = build_node(cfg.clone())?;
     let mut chain = node.chain.lock();
     match cmd {
+        SnapshotCmd::Info { .. } => unreachable!("handled above"),
         SnapshotCmd::Export { file } => {
             let f = std::io::BufWriter::new(std::fs::File::create(&file)?);
             xdag_chain::snapshot::export(&mut chain, f).map_err(|e| anyhow!("{e}"))?;
@@ -386,10 +395,35 @@ fn snapshot_cmd(cfg: &NodeConfig, cmd: SnapshotCmd) -> Result<()> {
         }
         SnapshotCmd::Import { file } => {
             let mut f = std::io::BufReader::new(std::fs::File::open(&file)?);
-            let h = xdag_chain::snapshot::import(&mut chain, &mut f).map_err(|e| anyhow!("{e}"))?;
+            let h = xdag_chain::snapshot::import(&mut chain, &mut f).map_err(|e| {
+                anyhow!(
+                    "{e}\nif the import had already started, the database is incomplete and the node will refuse it: delete {} and import again",
+                    cfg.db_path().display()
+                )
+            })?;
             println!("snapshot loaded at height {}", h.nmain);
         }
     }
+    Ok(())
+}
+
+fn snapshot_info(file: &std::path::Path) -> Result<()> {
+    let f = std::io::BufReader::new(std::fs::File::open(file)?);
+    let s = xdag_chain::snapshot::describe(f).map_err(|e| anyhow!("{e}"))?;
+    let xdag = |nano: u128| format!("{}.{:09}", nano / 1_000_000_000, nano % 1_000_000_000);
+    println!("format:            XSNP {}", xdag_chain::snapshot::VERSION);
+    println!("network:           {}", Network::from_id(s.header.network).map(|n| n.name()).unwrap_or("unknown"));
+    println!("main height:       {}", s.header.nmain);
+    println!("top:               {}  (difficulty {})", s.header.top.to_legacy_address(), xdag_types::difficulty::to_quantity_hex(s.header.top_diff));
+    println!("randomx schedule:  {}", if s.header.rx.is_some() { "included" } else { "derived on import" });
+    println!("accounts:          {}", s.accounts);
+    println!("  digest:          {}{}", hex::encode(s.accounts_digest), if s.accounts_sorted { "" } else { "  (accounts not in address order)" });
+    println!("  balances:        {} XDAG", xdag(s.legacy_nano + s.wei / 1_000_000_000));
+    println!("blocks:            {}  ({} with data, {} metadata only)", s.blocks, s.blocks_with_data, s.blocks - s.blocks_with_data);
+    println!("  balances:        {}{} XDAG", if s.block_nano < 0 { "-" } else { "" }, xdag(s.block_nano.unsigned_abs()));
+    println!("main-chain index:  {} entries", s.mains);
+    let records: Vec<String> = s.records.iter().map(|(t, n)| format!("{} {n}", t.name())).collect();
+    println!("record tables:     {}", if records.is_empty() { "none".to_string() } else { records.join(", ") });
     Ok(())
 }
 

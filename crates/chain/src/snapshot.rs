@@ -1,60 +1,76 @@
-//! Portable state snapshots ("XSNP" format).
+//! Portable state snapshots ("XSNP" format, version 2).
 //!
-//! Used to bootstrap from an existing xdagj network (converted with
-//! `tools/xdagj-exporter`) and for fast node bootstrap. Unlike xdagj's
-//! snapshot mechanism, loading a snapshot never deletes anything: blocks and
-//! history already present are kept, and pre-snapshot history can be imported
-//! separately into the archive tables (see `archive`).
+//! A snapshot is a complete copy of what the exporting node knows: every
+//! account, every block (with its raw data whenever the node has it), the
+//! main-chain index and the execution records. It is how an xdagj node's state
+//! is carried over (written by `tools/xdagj-exporter`) and how state moves
+//! between implementations. Loading a snapshot never deletes anything.
 //!
 //! ```text
-//! "XSNP" u8:version u8:network u64:nmain hashlow:top [32]:top_diff(BE)
-//! u64:horizon_time
-//! bytes:randomx_schedule
-//! u64:n  { [20]:address u8:kind(0=C-units,1=wei) u64|u128:balance u64:nonce }
-//! u64:n  { hashlow [32]:hash(0=unknown) u64:time u8:flags u64:height [32]:diff
-//!          opt hashlow:max_diff_link i64:amount u64:fee opt[32]:remark
-//!          u8:kind data  opt hashlow:ref }
+//! "XSNP" u8:version=2 u8:network u64:nmain hashlow:top [32]:top_diff(BE)
+//! u64:len randomx_schedule             (len 0: derived by the importer)
+//! u64:n  { [20]:address u8:kind(0=C-units u64, 1=wei u128) balance u64:nonce
+//!          opt[32]:code_hash }
+//! u64:n  { hashlow [32]:hash(0=unknown) u64:time u8:flags u8:status u64:height
+//!          [32]:diff(BE) opt hashlow:max_diff_link i64:amount u64:fee
+//!          opt[32]:remark u8:kind data opt hashlow:ref }
 //! u64:n  { u64:height hashlow }
+//! u8:n   { u8:table u64:n { u32:len key u32:len value } }
 //! ```
 //!
-//! Block `kind`: 0 = no key (unspendable), 1 = compressed public key (33),
-//! 2 = raw block kept only as key material (512), 3 = full block (512),
-//! 4 = full block (512) + u64 length + Nova payload.
+//! Integers are little-endian, `opt x` is a presence byte followed by `x`.
 //!
-//! Full blocks are regular DAG blocks on the importing node (they can be
-//! served to peers, referenced and, if still pending, applied later). The
-//! exporter carries in full every block newer than `horizon_time` and every
-//! block not yet processed by a main block; older processed blocks are kept
-//! only if they hold a balance (or are main blocks). A block older than the
-//! horizon that reaches the importing node later was therefore processed
-//! before the snapshot, and is recorded as such instead of being applied again.
+//! Block `kind`: 3 = the block's 512 raw bytes, 4 = raw bytes + u64 length +
+//! Nova payload. Blocks whose data the exporter does not have (xdagj keeps
+//! only metadata for blocks it inherited from its own snapshot) are carried
+//! as 0 = no key (unspendable), 1 = compressed public key (33 bytes) or
+//! 2 = raw block kept as key material only (512 bytes).
+//!
+//! `status` is the execution result of the block's own transaction
+//! ([`TxStatus`]), or [`STATUS_UNKNOWN`] to let the importer derive it from
+//! the flags. The trailing tables are raw copies of execution records
+//! (contract code and storage, history, transaction index, receipts).
+//!
+//! Nothing is pruned, deliberately. Whether a block has been executed is
+//! consensus state, and XDAG puts no lower bound on a block's timestamp or on
+//! how old a referenced block may be: a node that forgot old executed blocks
+//! could not tell a block that is sent again from a new one, and would execute
+//! it twice or not at all. Peers also compare per-range block checksums when
+//! they synchronise, which only match between nodes holding the same blocks.
 //!
 //! Main blocks up to `nmain` are final on the importing node: it never adopts
-//! a chain that forks below them.
+//! a chain that forks below them (their undo journals are not carried).
 
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use xdag_storage::Table;
+use xdag_storage::{Db, Table};
 use xdag_types::{Address, BlockHash, Difficulty, HashLow, Nano, Network, U256};
 
 use crate::chain::Chain;
 use crate::keys;
 use crate::pow::{RxSchedule, Seed};
-use crate::records::{flags, AccountRecord, Balance, BlockInfo, BlockState, ChainMeta, SnapshotKey};
+use crate::records::{flags, AccountRecord, Balance, BlockInfo, BlockState, ChainMeta, SnapshotKey, TxStatus};
 use crate::{ChainError, Result};
 
 pub const MAGIC: &[u8; 4] = b"XSNP";
+pub const VERSION: u8 = 2;
 
-/// Recent history `export` carries in full, in epochs before the top main block.
-pub const HORIZON_EPOCHS: u64 = 1024;
+/// Block status value meaning "derive it from the flags" (xdagj exports).
+pub const STATUS_UNKNOWN: u8 = 0xff;
+
+/// Execution-record tables carried verbatim.
+pub const RECORD_TABLES: [Table; 6] = [Table::Code, Table::Storage, Table::History, Table::TxIndex, Table::Receipt, Table::EvmTxs];
+
+const MAX_ROW_KEY: usize = 1 << 10;
+const MAX_ROW_VALUE: usize = 16 << 20;
 
 /// Key material / data of a snapshot block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotData {
     None,
     Key(SnapshotKey),
-    /// A block kept as a regular block (with its Nova payload, if any).
+    /// A regular block (with its Nova payload, if any).
     Full {
         raw: Box<[u8; 512]>,
         payload: Option<Vec<u8>>,
@@ -68,6 +84,8 @@ pub struct SnapshotBlock {
     pub time: u64,
     /// xdagj combined flags.
     pub flags: u8,
+    /// [`TxStatus`] of the block's own transaction, or [`STATUS_UNKNOWN`].
+    pub status: u8,
     pub height: u64,
     pub difficulty: Difficulty,
     pub max_diff_link: Option<HashLow>,
@@ -83,249 +101,395 @@ pub struct SnapshotBlock {
 pub struct SnapshotHeader {
     pub network: u8,
     pub nmain: u64,
-    pub horizon_time: u64,
     pub top: HashLow,
     pub top_diff: Difficulty,
-    pub rx: RxSchedule,
-}
-
-struct W<'a, T: Write>(&'a mut T);
-impl<T: Write> W<'_, T> {
-    fn b(&mut self, b: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(b)
-    }
-    fn u8(&mut self, v: u8) -> std::io::Result<()> {
-        self.b(&[v])
-    }
-    fn u64(&mut self, v: u64) -> std::io::Result<()> {
-        self.b(&v.to_le_bytes())
-    }
-}
-
-struct R<'a, T: Read>(&'a mut T);
-impl<T: Read> R<'_, T> {
-    fn arr<const N: usize>(&mut self) -> std::io::Result<[u8; N]> {
-        let mut b = [0u8; N];
-        self.0.read_exact(&mut b)?;
-        Ok(b)
-    }
-    fn u8(&mut self) -> std::io::Result<u8> {
-        Ok(self.arr::<1>()?[0])
-    }
-    fn u64(&mut self) -> std::io::Result<u64> {
-        Ok(u64::from_le_bytes(self.arr::<8>()?))
-    }
-    fn vec(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
-        let mut v = vec![0u8; n];
-        self.0.read_exact(&mut v)?;
-        Ok(v)
-    }
+    /// RandomX fork state. `None`: the importer derives it from the main chain.
+    pub rx: Option<RxSchedule>,
 }
 
 fn io(e: std::io::Error) -> ChainError {
     ChainError::Other(format!("snapshot i/o: {e}"))
 }
 
+fn order() -> ChainError {
+    ChainError::Other("snapshot sections written out of order".into())
+}
+
+/// Streaming writer: header, then the account, block and main-index sections
+/// (each announced with [`SnapshotWriter::section`]), then the record tables.
 pub struct SnapshotWriter<T: Write> {
     out: T,
+    /// 1 accounts, 2 blocks, 3 main index, 4 record tables.
+    stage: u8,
+    /// Entries the current section still expects.
+    open: u64,
+    /// Record tables still expected.
+    tables: u8,
 }
 
 impl<T: Write> SnapshotWriter<T> {
-    pub fn new(mut out: T, h: &SnapshotHeader) -> Result<Self> {
-        {
-            let mut w = W(&mut out);
-            w.b(MAGIC).map_err(io)?;
-            w.u8(1).map_err(io)?;
-            w.u8(h.network).map_err(io)?;
-            w.u64(h.nmain).map_err(io)?;
-            w.b(&h.top.0).map_err(io)?;
-            w.b(&h.top_diff.to_be_bytes::<32>()).map_err(io)?;
-            w.u64(h.horizon_time).map_err(io)?;
-            let rx = h.rx.encode();
-            w.u64(rx.len() as u64).map_err(io)?;
-            w.b(&rx).map_err(io)?;
+    pub fn new(out: T, h: &SnapshotHeader) -> Result<Self> {
+        let mut w = SnapshotWriter { out, stage: 0, open: 0, tables: 0 };
+        w.b(MAGIC)?;
+        w.u8(VERSION)?;
+        w.u8(h.network)?;
+        w.u64(h.nmain)?;
+        w.b(&h.top.0)?;
+        w.b(&h.top_diff.to_be_bytes::<32>())?;
+        let rx = h.rx.as_ref().map(|r| r.encode()).unwrap_or_default();
+        w.u64(rx.len() as u64)?;
+        w.b(&rx)?;
+        Ok(w)
+    }
+
+    fn b(&mut self, b: &[u8]) -> Result<()> {
+        self.out.write_all(b).map_err(io)
+    }
+    fn u8(&mut self, v: u8) -> Result<()> {
+        self.b(&[v])
+    }
+    fn u64(&mut self, v: u64) -> Result<()> {
+        self.b(&v.to_le_bytes())
+    }
+    fn opt(&mut self, v: Option<&[u8]>) -> Result<()> {
+        match v {
+            Some(v) => {
+                self.u8(1)?;
+                self.b(v)
+            }
+            None => self.u8(0),
         }
-        Ok(SnapshotWriter { out })
+    }
+    fn entry(&mut self, stage: u8) -> Result<()> {
+        if self.stage != stage || self.open == 0 {
+            return Err(order());
+        }
+        self.open -= 1;
+        Ok(())
+    }
+
+    /// Start the next of the three entry sections with its number of entries.
+    pub fn section(&mut self, n: u64) -> Result<()> {
+        if self.open != 0 || self.stage >= 3 {
+            return Err(order());
+        }
+        self.stage += 1;
+        self.open = n;
+        self.u64(n)
+    }
+
+    pub fn account(&mut self, a: &Address, r: &AccountRecord) -> Result<()> {
+        self.entry(1)?;
+        self.b(&a.0)?;
+        match r.balance {
+            Balance::Legacy(c) => {
+                self.u8(0)?;
+                self.u64(c)?;
+            }
+            Balance::Wei(v) => {
+                self.u8(1)?;
+                self.b(&v.to_le_bytes())?;
+            }
+        }
+        self.u64(r.nonce)?;
+        self.opt(r.code_hash.as_ref().map(|h| &h[..]))
+    }
+
+    pub fn block(&mut self, b: &SnapshotBlock) -> Result<()> {
+        self.entry(2)?;
+        self.b(&b.hashlow.0)?;
+        self.b(&b.hash.0)?;
+        self.u64(b.time)?;
+        self.u8(b.flags)?;
+        self.u8(b.status)?;
+        self.u64(b.height)?;
+        self.b(&b.difficulty.to_be_bytes::<32>())?;
+        self.opt(b.max_diff_link.as_ref().map(|h| &h.0[..]))?;
+        self.b(&b.amount.to_le_bytes())?;
+        self.u64(b.fee.0)?;
+        self.opt(b.remark.as_ref().map(|r| &r[..]))?;
+        match &b.data {
+            SnapshotData::None => self.u8(0)?,
+            SnapshotData::Key(SnapshotKey::PublicKey(k)) => {
+                self.u8(1)?;
+                self.b(k)?;
+            }
+            SnapshotData::Key(SnapshotKey::RawBlock(r)) => {
+                self.u8(2)?;
+                self.b(&r[..])?;
+            }
+            SnapshotData::Full { raw, payload } => {
+                self.u8(if payload.is_some() { 4 } else { 3 })?;
+                self.b(&raw[..])?;
+                if let Some(pl) = payload {
+                    self.u64(pl.len() as u64)?;
+                    self.b(pl)?;
+                }
+            }
+        }
+        self.opt(b.ref_.as_ref().map(|h| &h.0[..]))
+    }
+
+    pub fn main(&mut self, height: u64, h: &HashLow) -> Result<()> {
+        self.entry(3)?;
+        self.u64(height)?;
+        self.b(&h.0)
+    }
+
+    /// After the main index: the number of record tables that follow.
+    pub fn tables(&mut self, n: u8) -> Result<()> {
+        if self.stage != 3 || self.open != 0 {
+            return Err(order());
+        }
+        self.stage = 4;
+        self.tables = n;
+        self.u8(n)
+    }
+
+    pub fn table(&mut self, t: Table, rows: u64) -> Result<()> {
+        if self.stage != 4 || self.open != 0 || self.tables == 0 {
+            return Err(order());
+        }
+        self.tables -= 1;
+        self.open = rows;
+        self.u8(t as u8)?;
+        self.u64(rows)
+    }
+
+    pub fn row(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
+        self.entry(4)?;
+        self.b(&(k.len() as u32).to_le_bytes())?;
+        self.b(k)?;
+        self.b(&(v.len() as u32).to_le_bytes())?;
+        self.b(v)
+    }
+
+    pub fn finish(mut self) -> Result<T> {
+        if self.stage != 4 || self.open != 0 || self.tables != 0 {
+            return Err(order());
+        }
+        self.out.flush().map_err(io)?;
+        Ok(self.out)
     }
 
     pub fn accounts(&mut self, accts: &[(Address, AccountRecord)]) -> Result<()> {
-        let mut w = W(&mut self.out);
-        w.u64(accts.len() as u64).map_err(io)?;
-        for (a, r) in accts {
-            w.b(&a.0).map_err(io)?;
-            match r.balance {
-                Balance::Legacy(c) => {
-                    w.u8(0).map_err(io)?;
-                    w.u64(c).map_err(io)?;
-                }
-                Balance::Wei(v) => {
-                    w.u8(1).map_err(io)?;
-                    w.b(&v.to_le_bytes()).map_err(io)?;
-                }
-            }
-            w.u64(r.nonce).map_err(io)?;
-        }
-        Ok(())
+        self.section(accts.len() as u64)?;
+        accts.iter().try_for_each(|(a, r)| self.account(a, r))
     }
 
     pub fn blocks(&mut self, blocks: &[SnapshotBlock]) -> Result<()> {
-        let mut w = W(&mut self.out);
-        w.u64(blocks.len() as u64).map_err(io)?;
-        for b in blocks {
-            w.b(&b.hashlow.0).map_err(io)?;
-            w.b(&b.hash.0).map_err(io)?;
-            w.u64(b.time).map_err(io)?;
-            w.u8(b.flags).map_err(io)?;
-            w.u64(b.height).map_err(io)?;
-            w.b(&b.difficulty.to_be_bytes::<32>()).map_err(io)?;
-            match &b.max_diff_link {
-                Some(h) => {
-                    w.u8(1).map_err(io)?;
-                    w.b(&h.0).map_err(io)?;
-                }
-                None => w.u8(0).map_err(io)?,
-            }
-            w.b(&b.amount.to_le_bytes()).map_err(io)?;
-            w.u64(b.fee.0).map_err(io)?;
-            match &b.remark {
-                Some(r) => {
-                    w.u8(1).map_err(io)?;
-                    w.b(r).map_err(io)?;
-                }
-                None => w.u8(0).map_err(io)?,
-            }
-            match &b.data {
-                SnapshotData::None => w.u8(0).map_err(io)?,
-                SnapshotData::Key(SnapshotKey::PublicKey(k)) => {
-                    w.u8(1).map_err(io)?;
-                    w.b(k).map_err(io)?;
-                }
-                SnapshotData::Key(SnapshotKey::RawBlock(r)) => {
-                    w.u8(2).map_err(io)?;
-                    w.b(&r[..]).map_err(io)?;
-                }
-                SnapshotData::Full { raw, payload } => {
-                    w.u8(if payload.is_some() { 4 } else { 3 }).map_err(io)?;
-                    w.b(&raw[..]).map_err(io)?;
-                    if let Some(pl) = payload {
-                        w.u64(pl.len() as u64).map_err(io)?;
-                        w.b(pl).map_err(io)?;
-                    }
-                }
-            }
-            match &b.ref_ {
-                Some(h) => {
-                    w.u8(1).map_err(io)?;
-                    w.b(&h.0).map_err(io)?;
-                }
-                None => w.u8(0).map_err(io)?,
-            }
-        }
-        Ok(())
+        self.section(blocks.len() as u64)?;
+        blocks.iter().try_for_each(|b| self.block(b))
     }
 
+    /// The main index, followed by no record tables (as xdagj exports have).
     pub fn main_index(mut self, idx: &[(u64, HashLow)]) -> Result<T> {
-        let mut w = W(&mut self.out);
-        w.u64(idx.len() as u64).map_err(io)?;
-        for (h, hl) in idx {
-            w.u64(*h).map_err(io)?;
-            w.b(&hl.0).map_err(io)?;
+        self.section(idx.len() as u64)?;
+        idx.iter().try_for_each(|(h, hl)| self.main(*h, hl))?;
+        self.tables(0)?;
+        self.finish()
+    }
+}
+
+/// Streaming reader, the counterpart of [`SnapshotWriter`].
+pub struct SnapshotReader<T: Read> {
+    input: T,
+    max_payload: usize,
+}
+
+impl<T: Read> SnapshotReader<T> {
+    /// Read the header. `max_payload` bounds the Nova payload of a block.
+    pub fn new(input: T, max_payload: usize) -> Result<(Self, SnapshotHeader)> {
+        let mut r = SnapshotReader { input, max_payload };
+        if &r.arr::<4>()? != MAGIC {
+            return Err(ChainError::Invalid("not an XSNP snapshot".into()));
         }
-        Ok(self.out)
+        let version = r.u8()?;
+        if version != VERSION {
+            return Err(ChainError::Invalid(format!(
+                "snapshot format {version} is not supported (this version reads format {VERSION}): export it again with a matching exporter"
+            )));
+        }
+        let network = r.u8()?;
+        let nmain = r.u64()?;
+        let top = HashLow(r.arr::<24>()?);
+        let top_diff = U256::from_be_bytes(r.arr::<32>()?);
+        let rxlen = r.u64()? as usize;
+        if rxlen > 1 << 20 {
+            return Err(ChainError::Invalid("bad randomx schedule".into()));
+        }
+        let rx = match rxlen {
+            0 => None,
+            n => Some(RxSchedule::decode(&r.vec(n)?).ok_or_else(|| ChainError::Invalid("bad randomx schedule".into()))?),
+        };
+        Ok((r, SnapshotHeader { network, nmain, top, top_diff, rx }))
+    }
+
+    fn arr<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let mut b = [0u8; N];
+        self.input.read_exact(&mut b).map_err(io)?;
+        Ok(b)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.arr::<1>()?[0])
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.arr::<8>()?))
+    }
+    fn vec(&mut self, n: usize) -> Result<Vec<u8>> {
+        let mut v = vec![0u8; n];
+        self.input.read_exact(&mut v).map_err(io)?;
+        Ok(v)
+    }
+    fn opt<const N: usize>(&mut self) -> Result<Option<[u8; N]>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.arr::<N>()?)),
+            k => Err(ChainError::Invalid(format!("bad presence byte {k}"))),
+        }
+    }
+
+    /// Number of entries of the next section.
+    pub fn section(&mut self) -> Result<u64> {
+        self.u64()
+    }
+
+    pub fn account(&mut self) -> Result<(Address, AccountRecord)> {
+        let a = Address(self.arr::<20>()?);
+        let balance = match self.u8()? {
+            0 => Balance::Legacy(self.u64()?),
+            1 => Balance::Wei(u128::from_le_bytes(self.arr::<16>()?)),
+            k => return Err(ChainError::Invalid(format!("bad balance kind {k}"))),
+        };
+        let nonce = self.u64()?;
+        let code_hash = self.opt::<32>()?;
+        Ok((a, AccountRecord { balance, nonce, pending_nonce: 0, code_hash }))
+    }
+
+    pub fn block(&mut self) -> Result<SnapshotBlock> {
+        let hashlow = HashLow(self.arr::<24>()?);
+        let hash = BlockHash(self.arr::<32>()?);
+        let time = self.u64()?;
+        let flags = self.u8()?;
+        let status = self.u8()?;
+        if status > TxStatus::Failed as u8 && status != STATUS_UNKNOWN {
+            return Err(ChainError::Invalid(format!("bad block status {status}")));
+        }
+        let height = self.u64()?;
+        let difficulty = U256::from_be_bytes(self.arr::<32>()?);
+        let max_diff_link = self.opt::<24>()?.map(HashLow);
+        let amount = i64::from_le_bytes(self.arr::<8>()?);
+        let fee = Nano(self.u64()?);
+        let remark = self.opt::<32>()?;
+        let data = match self.u8()? {
+            0 => SnapshotData::None,
+            1 => SnapshotData::Key(SnapshotKey::PublicKey(self.arr::<33>()?)),
+            2 => SnapshotData::Key(SnapshotKey::RawBlock(Box::new(self.arr::<512>()?))),
+            3 => SnapshotData::Full { raw: Box::new(self.arr::<512>()?), payload: None },
+            4 => {
+                let raw = Box::new(self.arr::<512>()?);
+                let len = self.u64()? as usize;
+                if len > self.max_payload {
+                    return Err(ChainError::Invalid("snapshot payload too large".into()));
+                }
+                SnapshotData::Full { raw, payload: Some(self.vec(len)?) }
+            }
+            k => return Err(ChainError::Invalid(format!("bad snapshot block kind {k}"))),
+        };
+        let ref_ = self.opt::<24>()?.map(HashLow);
+        Ok(SnapshotBlock { hashlow, hash, time, flags, status, height, difficulty, max_diff_link, amount, fee, remark, data, ref_ })
+    }
+
+    pub fn main(&mut self) -> Result<(u64, HashLow)> {
+        Ok((self.u64()?, HashLow(self.arr::<24>()?)))
+    }
+
+    /// Number of record tables after the main index.
+    pub fn tables(&mut self) -> Result<u8> {
+        self.u8()
+    }
+
+    pub fn table(&mut self) -> Result<(Table, u64)> {
+        let id = self.u8()?;
+        let t = Table::from_u8(id)
+            .filter(|t| RECORD_TABLES.contains(t))
+            .ok_or_else(|| ChainError::Invalid(format!("unexpected table {id} in snapshot")))?;
+        Ok((t, self.u64()?))
+    }
+
+    pub fn row(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let klen = u32::from_le_bytes(self.arr::<4>()?) as usize;
+        if klen > MAX_ROW_KEY {
+            return Err(ChainError::Invalid("snapshot record key too large".into()));
+        }
+        let k = self.vec(klen)?;
+        let vlen = u32::from_le_bytes(self.arr::<4>()?) as usize;
+        if vlen > MAX_ROW_VALUE {
+            return Err(ChainError::Invalid("snapshot record too large".into()));
+        }
+        Ok((k, self.vec(vlen)?))
+    }
+
+    /// The snapshot must end here.
+    pub fn finish(mut self) -> Result<()> {
+        let mut trailing = [0u8; 1];
+        match self.input.read(&mut trailing).map_err(io)? {
+            0 => Ok(()),
+            _ => Err(ChainError::Invalid("trailing data after snapshot".into())),
+        }
     }
 }
 
 /// Load a snapshot into an empty chain database (archive tables may already
 /// hold imported history; nothing is ever deleted).
+///
+/// A snapshot that is not for this network or database is refused before
+/// anything is written. If the import fails later, the database stays marked
+/// as incomplete and `Chain::open` refuses it: it has to be deleted.
 pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeader> {
-    if chain.meta().nmain > 0 || chain.meta().top.is_some() {
+    if chain.meta().nmain > 0 || chain.meta().top.is_some() || chain.meta().nblocks > 0 {
         return Err(ChainError::Invalid("the chain database is not empty".into()));
     }
-    let mut r = R(input);
-    if &r.arr::<4>().map_err(io)? != MAGIC {
-        return Err(ChainError::Invalid("not an XSNP snapshot".into()));
-    }
-    if r.u8().map_err(io)? != 1 {
-        return Err(ChainError::Invalid("unsupported snapshot version".into()));
-    }
-    let network = r.u8().map_err(io)?;
-    if Network::from_id(network) != Some(chain.params().network) {
+    let params = chain.params().clone();
+    let ep = params.epochs();
+    let max_payload = params.nova.as_ref().map(|n| n.max_payload_bytes).unwrap_or(0);
+    let (mut r, header) = SnapshotReader::new(input, max_payload)?;
+    if Network::from_id(header.network) != Some(params.network) {
         return Err(ChainError::Invalid("snapshot is for another network".into()));
     }
-    let nmain = r.u64().map_err(io)?;
-    let top = HashLow(r.arr::<24>().map_err(io)?);
-    let top_diff = U256::from_be_bytes(r.arr::<32>().map_err(io)?);
-    let horizon_time = r.u64().map_err(io)?;
-    let rxlen = r.u64().map_err(io)? as usize;
-    if rxlen > 1 << 20 {
-        return Err(ChainError::Invalid("bad randomx schedule".into()));
-    }
-    // empty = let the importer derive it (the xdagj exporter does this)
-    let snap_rx = match rxlen {
-        0 => None,
-        n => Some(RxSchedule::decode(&r.vec(n).map_err(io)?).ok_or_else(|| ChainError::Invalid("bad randomx schedule".into()))?),
-    };
 
-    let n = r.u64().map_err(io)?;
-    for i in 0..n {
-        let a = Address(r.arr::<20>().map_err(io)?);
-        let balance = match r.u8().map_err(io)? {
-            0 => Balance::Legacy(r.u64().map_err(io)?),
-            1 => Balance::Wei(u128::from_le_bytes(r.arr::<16>().map_err(io)?)),
-            k => return Err(ChainError::Invalid(format!("bad balance kind {k}"))),
-        };
-        let nonce = r.u64().map_err(io)?;
-        chain.put_account(&a, &AccountRecord { balance, nonce, pending_nonce: 0, code_hash: None })?;
+    // The import is written in several commits. Mark the database first, so
+    // that a failed or interrupted import can never be opened as a chain.
+    chain.ov.put(Table::Meta, keys::META_SNAPSHOT_IMPORT.to_vec(), vec![1])?;
+    chain.commit(true)?;
+
+    for i in 0..r.section()? {
+        let (a, rec) = r.account()?;
+        chain.put_account(&a, &rec)?;
         if i % 100_000 == 99_999 {
             chain.commit(false)?;
         }
     }
-    let params = chain.params().clone();
-    let ep = params.epochs();
+
     let mut stored = 0u64;
-    let n = r.u64().map_err(io)?;
-    for i in 0..n {
-        let hashlow = HashLow(r.arr::<24>().map_err(io)?);
-        let hash = BlockHash(r.arr::<32>().map_err(io)?);
-        let time = r.u64().map_err(io)?;
-        let fl = r.u8().map_err(io)?;
-        let height = r.u64().map_err(io)?;
-        let difficulty = U256::from_be_bytes(r.arr::<32>().map_err(io)?);
-        let max_diff_link = if r.u8().map_err(io)? == 1 { Some(HashLow(r.arr::<24>().map_err(io)?)) } else { None };
-        let amount = i64::from_le_bytes(r.arr::<8>().map_err(io)?);
-        let fee = Nano(r.u64().map_err(io)?);
-        let remark = if r.u8().map_err(io)? == 1 { Some(r.arr::<32>().map_err(io)?) } else { None };
-        let data = match r.u8().map_err(io)? {
-            0 => SnapshotData::None,
-            1 => SnapshotData::Key(SnapshotKey::PublicKey(r.arr::<33>().map_err(io)?)),
-            2 => SnapshotData::Key(SnapshotKey::RawBlock(Box::new(r.arr::<512>().map_err(io)?))),
-            3 => SnapshotData::Full { raw: Box::new(r.arr::<512>().map_err(io)?), payload: None },
-            4 => {
-                let raw = Box::new(r.arr::<512>().map_err(io)?);
-                let len = r.u64().map_err(io)? as usize;
-                let max = params.nova.as_ref().map(|n| n.max_payload_bytes).unwrap_or(0);
-                if len > max {
-                    return Err(ChainError::Invalid("snapshot payload too large".into()));
-                }
-                SnapshotData::Full { raw, payload: Some(r.vec(len).map_err(io)?) }
-            }
-            k => return Err(ChainError::Invalid(format!("bad snapshot block kind {k}"))),
-        };
-        let ref_ = if r.u8().map_err(io)? == 1 { Some(HashLow(r.arr::<24>().map_err(io)?)) } else { None };
+    for i in 0..r.section()? {
+        let blk = r.block()?;
+        let (hashlow, fl) = (blk.hashlow, blk.flags);
         let mut info = BlockInfo {
-            hash,
-            time,
+            hash: blk.hash,
+            time: blk.time,
             type_word: 0,
             // our-block marks belong to the exporting node's wallet
             flags: fl & !flags::APPLY_MASK & !flags::EXTRA & !flags::OURS,
-            difficulty,
-            max_diff_link,
-            remark,
+            difficulty: blk.difficulty,
+            max_diff_link: blk.max_diff_link,
+            remark: blk.remark,
             snapshot: None,
             ext_root: None,
             payload_txs: 0,
         };
-        match data {
+        let mut status = if blk.status == STATUS_UNKNOWN { TxStatus::Pending as u8 } else { blk.status };
+        match blk.data {
             SnapshotData::Full { mut raw, payload } => {
                 let parse = |raw: &[u8; 512]| xdag_types::Block::parse(&raw[..]).map_err(|e| ChainError::Invalid(format!("snapshot block: {e}")));
                 let mut b = parse(&raw)?;
@@ -334,7 +498,7 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
                     raw[..8].fill(0);
                     b = parse(&raw)?;
                 }
-                if b.hashlow() != hashlow || (hash != BlockHash([0u8; 32]) && b.hash() != hash) || b.time != time {
+                if b.hashlow() != hashlow || (blk.hash != BlockHash([0u8; 32]) && b.hash() != blk.hash) || b.time != blk.time {
                     return Err(ChainError::Invalid(format!("snapshot block {hashlow:?} does not match its data")));
                 }
                 info.hash = b.hash();
@@ -347,9 +511,12 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
                     info.payload_txs = pl.txs.len() as u32;
                     chain.ov.put(Table::Payload, hashlow.0.to_vec(), payload.as_deref().cloned().unwrap_or_default())?;
                 }
+                if blk.status == STATUS_UNKNOWN && b.is_tx() && fl & flags::MAIN_REF != 0 {
+                    status = if fl & flags::APPLIED != 0 { TxStatus::Applied } else { TxStatus::Rejected } as u8;
+                }
                 chain.ov.put(Table::BlockRaw, hashlow.0.to_vec(), raw.to_vec())?;
-                chain.ov.put(Table::TimeIndex, keys::time_index(ep.epoch(time), &hashlow), vec![])?;
-                crate::sums::add_block(&mut chain.ov, time, b.sum())?;
+                chain.ov.put(Table::TimeIndex, keys::time_index(ep.epoch(blk.time), &hashlow), vec![])?;
+                crate::sums::add_block(&mut chain.ov, blk.time, b.sum())?;
                 if fl & flags::REF == 0 {
                     chain.ov.put(Table::NoRef, hashlow.0.to_vec(), vec![])?;
                 }
@@ -360,43 +527,51 @@ pub fn import<T: Read>(chain: &mut Chain, input: &mut T) -> Result<SnapshotHeade
             SnapshotData::None => info.snapshot = Some(SnapshotKey::PublicKey([0u8; 33])),
         }
         chain.put_info(&hashlow, info)?;
-        let st = BlockState {
-            flags: fl & flags::APPLY_MASK,
-            amount,
-            fee,
-            ref_: ref_.or(if fl & flags::MAIN != 0 { Some(hashlow) } else { None }),
-            height,
-            status: 0,
-        };
-        chain.put_state(&hashlow, &st)?;
+        let st = BlockState { flags: fl & flags::APPLY_MASK, amount: blk.amount, fee: blk.fee, ref_: blk.ref_, height: blk.height, status };
+        // blocks no main block has touched have no execution state
+        if st != BlockState::default() {
+            chain.put_state(&hashlow, &st)?;
+        }
         if i % 100_000 == 99_999 {
             chain.commit(false)?;
         }
     }
-    let n = r.u64().map_err(io)?;
-    for _ in 0..n {
-        let h = r.u64().map_err(io)?;
-        let hl = HashLow(r.arr::<24>().map_err(io)?);
+
+    for i in 0..r.section()? {
+        let (h, hl) = r.main()?;
         chain.ov.put(Table::MainHeight, keys::height(h), hl.0.to_vec())?;
+        if i % 100_000 == 99_999 {
+            chain.commit(false)?;
+        }
     }
-    let mut trailing = [0u8; 1];
-    if r.0.read(&mut trailing).map_err(io)? != 0 {
-        return Err(ChainError::Invalid("trailing data after snapshot".into()));
+
+    for _ in 0..r.tables()? {
+        let (t, rows) = r.table()?;
+        for i in 0..rows {
+            let (k, v) = r.row()?;
+            chain.ov.put(t, k, v)?;
+            if i % 100_000 == 99_999 {
+                chain.commit(false)?;
+            }
+        }
     }
-    chain.meta =
-        ChainMeta { nmain, top: Some(top), top_diff, nblocks: chain.meta.nblocks + stored, snapshot_height: nmain, snapshot_time: horizon_time };
+    r.finish()?;
+
+    let (nmain, top, top_diff) = (header.nmain, header.top, header.top_diff);
+    chain.meta = ChainMeta { nmain, top: Some(top), top_diff, nblocks: chain.meta.nblocks + stored, snapshot_height: nmain };
     chain.mark_meta_dirty();
     chain.commit(false)?;
     let rebuilt = rebuild_rx(chain)?;
-    let rx = match snap_rx {
+    let rx = match header.rx {
         None => rebuilt,
         Some(sr) if same_effect(&sr, &rebuilt) => sr,
         Some(_) => return Err(ChainError::Invalid("snapshot RandomX schedule does not match its main chain".into())),
     };
     chain.rx = rx.clone();
     chain.mark_meta_dirty();
+    chain.ov.delete(Table::Meta, keys::META_SNAPSHOT_IMPORT.to_vec())?;
     chain.commit(true)?;
-    Ok(SnapshotHeader { network, nmain, horizon_time, top, top_diff, rx })
+    Ok(SnapshotHeader { network: header.network, nmain, top, top_diff, rx: Some(rx) })
 }
 
 /// The RandomX state new blocks depend on (fork epoch and the last two seeds),
@@ -450,23 +625,24 @@ fn same_effect(a: &RxSchedule, b: &RxSchedule) -> bool {
     a.fork_epoch == b.fork_epoch && tail(a) == tail(b)
 }
 
-/// Export the current state with the default horizon (`HORIZON_EPOCHS`).
-pub fn export<T: Write>(chain: &mut Chain, out: T) -> Result<T> {
-    export_with_horizon(chain, out, HORIZON_EPOCHS)
+/// `Db::for_each` with a fallible body.
+fn each(db: &Db, t: Table, mut f: impl FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()> {
+    let mut failed = None;
+    db.for_each(t, |k, v| match f(k, v) {
+        Ok(()) => true,
+        Err(e) => {
+            failed = Some(e);
+            false
+        }
+    })?;
+    failed.map_or(Ok(()), Err)
 }
 
-/// Export accounts, main blocks, blocks holding a balance, every block not yet
-/// processed and every block of the last `horizon_epochs` epochs.
-pub fn export_with_horizon<T: Write>(chain: &mut Chain, out: T, horizon_epochs: u64) -> Result<T> {
+/// Export everything the node knows (streamed straight from the database).
+pub fn export<T: Write>(chain: &mut Chain, out: T) -> Result<T> {
     chain.commit(true)?;
     let db = chain.db().clone();
     let meta = chain.meta().clone();
-    let ep = chain.params().epochs();
-    let top_main_time = match chain.main_at(meta.nmain)? {
-        Some(m) => chain.info(&m)?.map(|i| i.time).unwrap_or(0),
-        None => 0,
-    };
-    let horizon_time = ep.start_of_epoch(ep.epoch(top_main_time).saturating_sub(horizon_epochs)).max(meta.snapshot_time);
     // an unsaved in-memory candidate cannot be exported: fall back to the
     // last main block (the importing node re-selects its top from there)
     let (top, top_diff) = match meta.top {
@@ -476,50 +652,39 @@ pub fn export_with_horizon<T: Write>(chain: &mut Chain, out: T, horizon_epochs: 
             None => (HashLow::ZERO, U256::ZERO),
         },
     };
-    let header =
-        SnapshotHeader { network: chain.params().network.id(), nmain: meta.nmain, horizon_time, top, top_diff, rx: chain.rx_schedule().clone() };
+    let header = SnapshotHeader { network: chain.params().network.id(), nmain: meta.nmain, top, top_diff, rx: Some(chain.rx_schedule().clone()) };
     let mut w = SnapshotWriter::new(out, &header)?;
-    let mut accts = vec![];
-    db.for_each(Table::Account, |k, v| {
-        if let (Some(a), Ok(r)) = (Address::from_slice(k), AccountRecord::decode(v)) {
-            accts.push((a, r));
-        }
-        true
-    })?;
-    w.accounts(&accts)?;
-    drop(accts);
+    let bad_key = |t: &str| ChainError::Corrupt(format!("{t} key"));
 
-    let mut infos = vec![];
-    db.for_each(Table::BlockInfo, |k, v| {
-        if let (Some(h), Ok(i)) = (HashLow::from_slice(k), BlockInfo::decode(v)) {
-            infos.push((h, i));
-        }
-        true
+    w.section(db.count(Table::Account)?)?;
+    each(&db, Table::Account, |k, v| {
+        let a = Address::from_slice(k).ok_or_else(|| bad_key("account"))?;
+        w.account(&a, &AccountRecord::decode(v)?)
     })?;
-    let mut blocks = vec![];
-    for (h, info) in infos {
-        let s = chain.state(&h)?;
-        let keeps_value = s.amount != 0 || s.flags & flags::MAIN != 0;
+
+    w.section(db.count(Table::BlockInfo)?)?;
+    each(&db, Table::BlockInfo, |k, v| {
+        let h = HashLow::from_slice(k).ok_or_else(|| bad_key("block"))?;
+        let info = BlockInfo::decode(v)?;
+        let s = match db.get(Table::BlockState, k)? {
+            Some(b) => BlockState::decode(&b)?,
+            None => BlockState::default(),
+        };
         let data = match &info.snapshot {
-            Some(k) if keeps_value => SnapshotData::Key(k.clone()),
-            Some(_) => continue,
+            Some(key) => SnapshotData::Key(key.clone()),
             None => {
-                let Some(b) = chain.block(&h)? else { continue };
-                if info.time >= horizon_time || s.flags & flags::MAIN_REF == 0 {
-                    let payload = if info.ext_root.is_some() { db.get(Table::Payload, &h.0)? } else { None };
-                    SnapshotData::Full { raw: Box::new(*b.raw()), payload }
-                } else if keeps_value {
-                    SnapshotData::Key(SnapshotKey::RawBlock(Box::new(*b.raw())))
-                } else {
-                    continue;
-                }
+                let raw = db.get(Table::BlockRaw, k)?.ok_or_else(|| ChainError::Corrupt(format!("block {h:?} has no data")))?;
+                let raw: [u8; 512] = raw.try_into().map_err(|_| ChainError::Corrupt(format!("block {h:?} has a bad size")))?;
+                let payload = if info.ext_root.is_some() { db.get(Table::Payload, k)? } else { None };
+                SnapshotData::Full { raw: Box::new(raw), payload }
             }
         };
-        blocks.push(SnapshotBlock {
+        w.block(&SnapshotBlock {
             hashlow: h,
             hash: info.hash,
             time: info.time,
             flags: info.flags | s.flags,
+            status: s.status,
             height: s.height,
             difficulty: info.difficulty,
             max_diff_link: info.max_diff_link,
@@ -528,15 +693,92 @@ pub fn export_with_horizon<T: Write>(chain: &mut Chain, out: T, horizon_epochs: 
             remark: info.remark,
             data,
             ref_: s.ref_,
-        });
+        })
+    })?;
+
+    w.section(db.count(Table::MainHeight)?)?;
+    each(&db, Table::MainHeight, |k, v| {
+        let height = u64::from_be_bytes(k.try_into().map_err(|_| bad_key("main height"))?);
+        w.main(height, &HashLow::from_slice(v).ok_or_else(|| bad_key("main height"))?)
+    })?;
+
+    w.tables(RECORD_TABLES.len() as u8)?;
+    for t in RECORD_TABLES {
+        w.table(t, db.count(t)?)?;
+        each(&db, t, |k, v| w.row(k, v))?;
     }
-    w.blocks(&blocks)?;
-    drop(blocks);
-    let mut idx = vec![];
-    for h in 1..=meta.nmain {
-        if let Some(hl) = chain.main_at(h)? {
-            idx.push((h, hl));
+    w.finish()
+}
+
+/// What a snapshot file contains (`xdagd snapshot info`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub header: SnapshotHeader,
+    pub accounts: u64,
+    /// Running hash over the account entries in file order:
+    /// `d = sha256(d ‖ address ‖ kind ‖ balance ‖ nonce ‖ code hash)`, from 32 zero bytes.
+    pub accounts_digest: [u8; 32],
+    /// Accounts are in ascending address order (as both exporters write
+    /// them): equal account sets then give equal digests.
+    pub accounts_sorted: bool,
+    /// Sum of legacy balances, converted to nano the way xdagj displays them.
+    pub legacy_nano: u128,
+    /// Sum of Nova balances.
+    pub wei: u128,
+    pub blocks: u64,
+    pub blocks_with_data: u64,
+    /// Sum of block balances (nano).
+    pub block_nano: i128,
+    pub mains: u64,
+    pub records: Vec<(Table, u64)>,
+}
+
+/// Read a snapshot through without importing it.
+pub fn describe<T: Read>(input: T) -> Result<SnapshotSummary> {
+    let (mut r, header) = SnapshotReader::new(input, MAX_ROW_VALUE)?;
+    let mut s = SnapshotSummary { header, accounts_sorted: true, ..Default::default() };
+    s.accounts = r.section()?;
+    let mut last: Option<Address> = None;
+    for _ in 0..s.accounts {
+        let (a, rec) = r.account()?;
+        let mut e = s.accounts_digest.to_vec();
+        e.extend_from_slice(&a.0);
+        match rec.balance {
+            Balance::Legacy(c) => {
+                e.push(0);
+                e.extend_from_slice(&c.to_le_bytes());
+                let nano = xdag_types::CAmount(c).to_nano_legacy().map_err(|_| ChainError::Invalid(format!("balance of {a:?} out of range")))?;
+                s.legacy_nano += nano.0 as u128;
+            }
+            Balance::Wei(w) => {
+                e.push(1);
+                e.extend_from_slice(&w.to_le_bytes());
+                s.wei = s.wei.checked_add(w).ok_or(ChainError::Overflow)?;
+            }
         }
+        e.extend_from_slice(&rec.nonce.to_le_bytes());
+        e.extend_from_slice(&rec.code_hash.unwrap_or([0u8; 32]));
+        s.accounts_digest = xdag_types::hash::sha256(&e);
+        s.accounts_sorted &= last.is_none_or(|l| l.0 < a.0);
+        last = Some(a);
     }
-    w.main_index(&idx)
+    s.blocks = r.section()?;
+    for _ in 0..s.blocks {
+        let b = r.block()?;
+        s.blocks_with_data += matches!(b.data, SnapshotData::Full { .. }) as u64;
+        s.block_nano += b.amount as i128;
+    }
+    s.mains = r.section()?;
+    for _ in 0..s.mains {
+        r.main()?;
+    }
+    for _ in 0..r.tables()? {
+        let (t, rows) = r.table()?;
+        for _ in 0..rows {
+            r.row()?;
+        }
+        s.records.push((t, rows));
+    }
+    r.finish()?;
+    Ok(s)
 }

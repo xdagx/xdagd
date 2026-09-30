@@ -34,6 +34,14 @@ pub struct P2pConfig {
     pub allow_private: bool,
     /// Optional local deny list.
     pub deny: Vec<IpAddr>,
+    /// Peers this node talks to besides its seeds while the network is closed.
+    ///
+    /// The network is open to everyone once Nova rules are in force. Before
+    /// that (a network still running xdagj's rules, which are only safe among
+    /// a closed set of nodes) the node talks to its seeds and these addresses
+    /// only. A non-empty list keeps the node closed in any case; listing
+    /// `0.0.0.0` opens it regardless of the rules (test networks).
+    pub allow: Vec<IpAddr>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +104,17 @@ pub struct WalletConfig {
     pub password: Option<String>,
 }
 
+impl P2pConfig {
+    /// Whether anyone may connect, given whether Nova rules are in force now
+    /// (see [`P2pConfig::allow`]).
+    pub fn open_network(&self, nova_active: bool) -> bool {
+        if self.allow.iter().any(|ip| ip.is_unspecified()) {
+            return true;
+        }
+        self.allow.is_empty() && nova_active
+    }
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self::for_network(Network::Devnet)
@@ -132,6 +151,7 @@ impl NodeConfig {
                 max_inbound_per_ip: 4,
                 allow_private: n == Network::Devnet,
                 deny: vec![],
+                allow: vec![],
             },
             rpc: RpcConfig { enabled: true, listen: format!("127.0.0.1:{}", p.default_rpc_port).parse().unwrap(), cors_origin: None },
             pool: PoolConfig {
@@ -234,5 +254,19 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let again = NodeConfig::from_toml(&text).unwrap();
         assert_eq!(again.p2p.seeds, c.p2p.seeds);
+    }
+
+    #[test]
+    fn the_network_is_closed_until_nova_rules_are_in_force() {
+        let mut p = NodeConfig::for_network(Network::Mainnet).p2p;
+        assert!(!p.open_network(false), "xdagj rules: seeds and allow list only");
+        assert!(p.open_network(true), "Nova rules: open to everyone");
+        p.allow = vec!["10.0.0.7".parse().unwrap()];
+        assert!(!p.open_network(true), "an allow list keeps the node private");
+        p.allow.push("0.0.0.0".parse().unwrap());
+        assert!(p.open_network(false), "explicitly opened (test networks)");
+        // and it parses from the configuration file
+        let c = NodeConfig::from_toml("network = \"testnet\"\n[p2p]\nallow = [\"10.0.0.7\"]\n").unwrap();
+        assert_eq!(c.p2p.allow, vec!["10.0.0.7".parse::<IpAddr>().unwrap()]);
     }
 }

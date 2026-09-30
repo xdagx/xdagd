@@ -5,8 +5,10 @@
 - **与现网兼容**：512 字节区块格式、DAG 共识（`tryToConnect` / `checkNewMain` / `setMain` / `applyBlock`）、RandomX、
   金额换算、P2P 帧与握手、`wallet.data`、`xdag_*` JSON-RPC、矿池 WebSocket 接口都按 xdagj 源码逐项移植，
   旧规则下的金额运算逐位复现 xdagj 的结果（包括它经过 `double` 的有损换算）。
-- **去掉节点白名单**：任何人都可以运行节点、互相发现（节点交换 `GET_PEERS`/`PEERS`），
+- **去掉节点白名单**：Nova 规则生效后任何人都可以运行节点、互相发现（节点交换 `GET_PEERS`/`PEERS`），
   取而代之的是按 IP / 子网的连接上限、令牌桶限流、节点打分与临时封禁。
+  在仍按 xdagj 旧规则运行的网络上（迁移期间的主网），节点只和配置的种子 / 允许列表通信——
+  旧规则只有在封闭的节点集合里才安全，节点不能成为外人进入这个网络的入口。
 - **升级不再丢历史**：存储使用显式版本化的记录编码 + schema 迁移，从不清库；交易历史在**执行时**写入并随回滚撤销；
   可导入 xdagj 快照与全部原始区块归档。
 - **智能合约**：内置 EVM（[revm](https://github.com/bluealloy/revm)，Prague 规则），提供 `eth_*` RPC，MetaMask / ethers / Foundry 可直接使用。
@@ -31,7 +33,7 @@ Go 的优势（上手更快、可以直接复用 geth、对 Java 背景的开发
 
 | | xdagj 0.8.4 | xdagd |
 |---|---|---|
-| 节点准入 | 白名单（`whiteIPs` 为空则拒绝所有入站，节点只能来自配置） | 开放；节点发现 + 限流 / 打分 / 封禁 |
+| 节点准入 | 白名单（`whiteIPs` 为空则拒绝所有入站，节点只能来自配置） | Nova 规则下开放：节点发现 + 限流 / 打分 / 封禁；旧规则下只与配置的节点通信 |
 | 升级 | Kryo 按 Java 类结构序列化，类一变就要清库、从余额快照重建，历史丢失 | 版本化记录编码 + schema 迁移；更新版本的库会被拒绝打开而不是被破坏 |
 | 交易历史 | 收到区块时写入 MySQL；回滚不撤销；被拒绝的交易也会进入历史 | 主块执行时写入（带状态：成功 / 拒绝 / 失败但扣费）；回滚时精确撤销 |
 | 金额 | 多处经 `double` 换算；RPC / 命令行转账金额被四舍五入到 0.01 XDAG | 整数精确（十进制解析，9 位小数） |
@@ -94,7 +96,7 @@ MetaMask：添加网络，RPC 填 `http://127.0.0.1:30001`，链 ID 用 `xdag_ge
 | `xdagd run` | 运行节点（默认） |
 | `xdagd init [file]` | 输出当前生效配置（TOML） |
 | `xdagd wallet create / list / new-account / restore <助记词>` | 钱包（与 xdagj `wallet.data` v4 互通，密码取自 `XDAG_WALLET_PASSWORD`） |
-| `xdagd snapshot export <file>` / `import <file>` | XSNP 状态快照导出 / 导入 |
+| `xdagd snapshot export <file>` / `import <file>` / `info <file>` | XSNP 状态快照：导出本节点的全部状态 / 导入到全新的数据目录 / 查看快照内容与账户摘要 |
 | `xdagd archive import-raw <files...>` / `history <地址或区块>` | 导入原始区块归档（xdagj 导出或旧 C 版 `storage/*.dat`）并查询历史 |
 | `xdagd status` | 本地数据库状态 |
 | `xdagd bench [--txs N] [--senders N] [--legacy]` | 在本机测量吞吐 |
@@ -132,6 +134,8 @@ docs/                  设计、Bug 清单、迁移方案、性能测试、RPC �
 
 - 没有在真实主网数据或与 xdagj 节点的实网互联中验证过（开发环境没有 Java，主网有白名单）。
   兼容性依据是逐行对照 xdagj 源码移植，以及 xdagj / xdagj-crypto 自带的测试向量。
+- **不能直接从零同步主网**：xdagj 节点只接受白名单内的 IP，而且它们自己是从余额快照启动的，没有更早的区块。
+  接入主网需要先从一台 xdagj 节点导出状态并导入，见 [docs/MIGRATION.md](docs/MIGRATION.md) 阶段 0。
 - `tools/xdagj-exporter` 未编译运行过，迁移前必须在数据副本上演练。
 - Nova 在主网的激活 epoch、链 ID 等参数尚未确定（主网默认不激活）。
 - Nova 激活后所有非候选块（包括交易块）都需要少量反垃圾工作量，xdagj 旧钱包构造的交易块会被拒绝，

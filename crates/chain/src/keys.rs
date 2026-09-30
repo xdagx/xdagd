@@ -32,3 +32,5 @@ pub fn storage_slot(a: &Address, slot: &[u8; 32]) -> Vec<u8> {
 pub const META_CHAIN: &[u8] = b"chain";
 pub const META_RX: &[u8] = b"randomx";
 pub const META_HISTORY_SEQ: &[u8] = b"history_seq";
+/// Present while a snapshot import is in progress (see `snapshot::import`).
+pub const META_SNAPSHOT_IMPORT: &[u8] = b"snapshot_import";

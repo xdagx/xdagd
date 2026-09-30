@@ -1,7 +1,7 @@
 //! One peer connection: handshake, then message dispatch with rate limits.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ use crate::{ConnId, NetInner, PeerHandle};
 pub const MAX_RANGE: i64 = 1 << 20;
 /// Cap on blocks served for one range request.
 pub const MAX_RANGE_BLOCKS: usize = 50_000;
+/// A peer that asked for a block range but takes none of it for this long is dropped.
+const REPLY_STALL: Duration = Duration::from_secs(30);
 
 fn now_ms() -> i64 {
     xdag_types::time::now_ms() as i64
@@ -187,6 +189,7 @@ async fn session(
         connected: Instant::now(),
         tx: tx.clone(),
         closed: AtomicBool::new(false),
+        ranges_pending: AtomicU64::new(0),
     });
     if let Err(r) = inner.register(handle.clone()) {
         disconnect(r);
@@ -195,7 +198,7 @@ async fn session(
     inner.add_addr(SocketAddr::new(addr.ip(), remote.port as u16));
     tracing::info!(peer = %remote.peer_id, %addr, inbound, client = %remote.client_id, nova = handle.nova, "peer connected");
 
-    let mut limits = PeerLimits::default();
+    let mut limits = if inner.is_trusted(&addr.ip()) { PeerLimits::unlimited() } else { PeerLimits::default() };
     let mut last_rx = Instant::now();
     let mut ping = tokio::time::interval(Duration::from_secs(60));
     ping.tick().await;
@@ -214,9 +217,21 @@ async fn session(
                 match m {
                     Ok(Some(m)) => {
                         last_rx = Instant::now();
-                        if let Err(e) = dispatch(inner, &handle, m, &mut limits) {
-                            inner.score(conn, -20, &e);
-                            tracing::debug!(peer = %handle.peer_id, "protocol violation: {e}");
+                        match dispatch(inner, &handle, m, &mut limits) {
+                            // A reply the peer asked for is delivered in full, at the
+                            // pace the peer reads it (nothing else is read meanwhile).
+                            Ok(reply) => {
+                                for m in reply {
+                                    match tokio::time::timeout(REPLY_STALL, tx.send(m)).await {
+                                        Ok(Ok(())) => {}
+                                        _ => return Err("peer does not take the blocks it asked for".into()),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                inner.score(conn, -20, &e);
+                                tracing::debug!(peer = %handle.peer_id, "protocol violation: {e}");
+                            }
                         }
                     }
                     Ok(None) => {}
@@ -229,8 +244,11 @@ async fn session(
     Ok(())
 }
 
-fn dispatch(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, m: Message, lim: &mut PeerLimits) -> Result<(), String> {
+/// Handle one message. The returned messages are a reply that must reach the
+/// peer completely (a block range); everything else is sent best-effort.
+fn dispatch(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, m: Message, lim: &mut PeerLimits) -> Result<Vec<Message>, String> {
     let chain = &inner.chain;
+    let mut reply = vec![];
     match m {
         Message::Disconnect(r) => {
             tracing::debug!(peer = %p.peer_id, reason = ?Reason::from_u8(r), "peer sent DISCONNECT");
@@ -265,7 +283,8 @@ fn dispatch(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, m: Message, lim: &mut Pe
             // The execution state xdagj attaches is ignored: execution results
             // are always computed locally (xdagj copied them from peers during
             // sync, letting any peer dictate which transactions fail).
-            if !lim.blocks.take(0.2) {
+            // blocks of a range we asked this peer for are not rate limited
+            if p.ranges_pending.load(Ordering::SeqCst) == 0 && !lim.blocks.take(0.2) {
                 return Err("sync block rate limit".into());
             }
             if block.len() != xdag_types::BLOCK_SIZE {
@@ -304,14 +323,14 @@ fn dispatch(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, m: Message, lim: &mut Pe
             }
             for (raw, exec) in chain.blocks_in_range(b.start as u64, b.end as u64, MAX_RANGE_BLOCKS) {
                 let h = xdag_types::BlockHash::of_raw(&raw).hashlow();
-                p.send(Message::SyncBlock { block: raw, ttl: 1, exec_state: exec });
+                reply.push(Message::SyncBlock { block: raw, ttl: 1, exec_state: exec });
                 if p.nova {
                     if let Some(pl) = chain.get_payload(&h) {
-                        p.send(Message::Payload(h, pl));
+                        reply.push(Message::Payload(h, pl));
                     }
                 }
             }
-            p.send(Message::BlocksReply(XdagBody::new(b.start, b.end, b.random, chain.stats())));
+            reply.push(Message::BlocksReply(XdagBody::new(b.start, b.end, b.random, chain.stats())));
         }
         Message::BlocksReply(b) => {
             if let Some(s) = inner.pending_ranges.lock().remove(&b.random) {
@@ -338,6 +357,8 @@ fn dispatch(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, m: Message, lim: &mut Pe
             p.send(Message::Peers(inner.known_addrs(32)));
         }
         Message::Peers(list) => {
+            // a closed network is not extended by what peers tell us
+            let list = if chain.open_network() { list } else { vec![] };
             for (h, port) in list.into_iter().take(64) {
                 if let Ok(ip) = h.parse::<std::net::IpAddr>() {
                     inner.add_addr(SocketAddr::new(ip, port));
@@ -365,7 +386,7 @@ fn dispatch(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, m: Message, lim: &mut Pe
             chain.on_txs(txs, p.conn);
         }
     }
-    Ok(())
+    Ok(reply)
 }
 
 /// Hashlow of a raw block (helper for callers).

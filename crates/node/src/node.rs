@@ -444,6 +444,14 @@ impl Node {
         }
     }
 
+    /// Anyone may connect once Nova rules are in force. A network still on
+    /// xdagj's rules is only safe among a closed set of nodes (see
+    /// docs/BUGS.md, C1 and C2), so until then the node keeps to its seeds and
+    /// its allow list.
+    pub fn open_network(&self) -> bool {
+        self.cfg.p2p.open_network(self.params.is_nova_time(xdag_types::time::now_xdag()))
+    }
+
     pub fn evm_env(&self) -> EvmEnv {
         let nova = self.params.nova.clone().unwrap_or_else(|| xdag_types::NovaParams::defaults(0));
         let meta = query::chain_meta(&self.db).unwrap_or_default();
@@ -559,6 +567,12 @@ impl ChainHandle for NetBridge {
     }
     fn get_payload(&self, h: &HashLow) -> Option<Vec<u8>> {
         self.0.db.get(Table::Payload, &h.0).ok().flatten()
+    }
+    fn open_network(&self) -> bool {
+        self.0.open_network()
+    }
+    fn import_backlog(&self) -> usize {
+        self.0.import_tx.len()
     }
 }
 

@@ -62,8 +62,12 @@ pub struct NetConfig {
     pub ttl: i32,
     /// Allow private/loopback addresses from peer exchange (devnets).
     pub allow_private: bool,
-    /// Optional local deny list (IPs); there is no allow list.
+    /// Optional local deny list (IPs).
     pub deny: Vec<IpAddr>,
+    /// Peers this node talks to while the network is closed (see
+    /// [`ChainHandle::open_network`]), in addition to its seeds. They are
+    /// the operator's choice: never banned, redialled for as long as it takes.
+    pub allow: Vec<IpAddr>,
     pub peers_file: Option<PathBuf>,
 }
 
@@ -91,6 +95,7 @@ impl Default for NetConfig {
             ttl: 5,
             allow_private: false,
             deny: vec![],
+            allow: vec![],
             peers_file: None,
         }
     }
@@ -114,6 +119,18 @@ pub trait ChainHandle: Send + Sync + 'static {
     fn blocks_in_range(&self, start: u64, end: u64, limit: usize) -> Vec<(Vec<u8>, u8)>;
     fn sums(&self, start: u64, end: u64) -> Option<[u8; 256]>;
     fn get_payload(&self, h: &HashLow) -> Option<Vec<u8>>;
+    /// Whether anyone may connect. While this is false the node only talks to
+    /// its seeds and its allow list: on a network that still runs xdagj's
+    /// rules (whose safety depends on a closed set of nodes) it must not
+    /// become the door through which strangers reach that network.
+    fn open_network(&self) -> bool {
+        true
+    }
+    /// Blocks received but not imported yet. Range synchronisation waits while
+    /// this is large instead of fetching blocks only to have them dropped.
+    fn import_backlog(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +162,9 @@ pub(crate) struct PeerHandle {
     pub connected: Instant,
     pub tx: mpsc::Sender<Message>,
     pub closed: AtomicBool,
+    /// Range requests we sent to this peer and that are still being answered:
+    /// the blocks arriving meanwhile were asked for.
+    pub ranges_pending: AtomicU64,
 }
 
 impl PeerHandle {
@@ -184,12 +204,23 @@ pub(crate) struct NetInner {
     pub pending_ranges: Mutex<HashMap<i64, oneshot::Sender<()>>>,
     /// Recently relayed blocks (avoid echoing the same block around).
     seen: Mutex<(HashSet<HashLow>, VecDeque<HashLow>)>,
+    /// Seed and allow-list addresses: the only peers while the network is closed.
+    trusted: RwLock<HashSet<IpAddr>>,
     pub shutdown: AtomicBool,
 }
 
 impl NetInner {
     pub fn advertise_port(&self) -> u16 {
         self.cfg.advertise_port.unwrap_or(self.cfg.listen.port())
+    }
+
+    pub fn is_trusted(&self, ip: &IpAddr) -> bool {
+        self.trusted.read().contains(&ip.to_canonical())
+    }
+
+    /// Whether this node may exchange anything with `ip` right now.
+    pub fn may_talk_to(&self, ip: &IpAddr) -> bool {
+        self.chain.open_network() || self.is_trusted(ip)
     }
 
     pub fn is_banned(&self, ip: &IpAddr) -> bool {
@@ -208,6 +239,11 @@ impl NetInner {
     }
 
     pub fn ban(&self, ip: IpAddr, why: &str) {
+        if self.is_trusted(&ip) {
+            // the operator chose this peer; what it sends must be looked at, not dropped
+            tracing::error!(%ip, "configured peer misbehaves (not banned): {why}");
+            return;
+        }
         tracing::warn!(%ip, "banning peer: {why}");
         self.bans.lock().insert(ip, Instant::now() + self.cfg.ban_duration);
         let victims: Vec<_> = self.peers.read().values().filter(|p| p.addr.ip() == ip).cloned().collect();
@@ -444,7 +480,11 @@ impl NetHandle {
 /// Start listening, dialing seeds and discovery. Returns immediately.
 pub async fn start(cfg: NetConfig, id: Identity, chain: Arc<dyn ChainHandle>) -> std::io::Result<NetHandle> {
     let listener = TcpListener::bind(cfg.listen).await?;
-    tracing::info!(listen = %cfg.listen, peer_id = %id.peer_id, "p2p listening (open network, no whitelist)");
+    if chain.open_network() {
+        tracing::info!(listen = %cfg.listen, peer_id = %id.peer_id, "p2p listening (open network, no whitelist)");
+    } else {
+        tracing::info!(listen = %cfg.listen, peer_id = %id.peer_id, "p2p listening (closed network: only seeds and allow-listed peers)");
+    }
     let inner = Arc::new(NetInner {
         cfg: cfg.clone(),
         id,
@@ -458,6 +498,7 @@ pub async fn start(cfg: NetConfig, id: Identity, chain: Arc<dyn ChainHandle>) ->
         pending_sums: Mutex::new(HashMap::new()),
         pending_ranges: Mutex::new(HashMap::new()),
         seen: Mutex::new((HashSet::new(), VecDeque::new())),
+        trusted: RwLock::new(cfg.allow.iter().map(|ip| ip.to_canonical()).collect()),
         shutdown: AtomicBool::new(false),
     });
     load_peers(&inner);
@@ -465,6 +506,7 @@ pub async fn start(cfg: NetConfig, id: Identity, chain: Arc<dyn ChainHandle>) ->
         match tokio::net::lookup_host(s.as_str()).await {
             Ok(addrs) => {
                 for a in addrs {
+                    inner.trusted.write().insert(a.ip().to_canonical());
                     inner.addrs.lock().entry(a).or_default();
                 }
             }
@@ -523,6 +565,10 @@ pub async fn start(cfg: NetConfig, id: Identity, chain: Arc<dyn ChainHandle>) ->
 
 fn accept(inner: Arc<NetInner>, stream: TcpStream, addr: SocketAddr) {
     let ip = addr.ip();
+    if !inner.may_talk_to(&ip) {
+        tracing::debug!(%addr, "inbound connection refused: the network is closed to unknown peers");
+        return;
+    }
     if inner.is_banned(&ip) {
         return;
     }
@@ -566,7 +612,7 @@ fn accept(inner: Arc<NetInner>, stream: TcpStream, addr: SocketAddr) {
 }
 
 async fn dial(inner: Arc<NetInner>, addr: SocketAddr) {
-    if inner.is_banned(&addr.ip()) || !inner.dialing.lock().insert(addr) {
+    if !inner.may_talk_to(&addr.ip()) || inner.is_banned(&addr.ip()) || !inner.dialing.lock().insert(addr) {
         return;
     }
     {
@@ -610,9 +656,11 @@ fn dial_more(inner: &Arc<NetInner>) {
         .lock()
         .iter()
         .filter(|(a, e)| {
+            // configured peers are retried for as long as it takes; others are given up on
             !connected.contains(a)
-                && e.failures < 10
-                && e.last_attempt.map(|t| now.duration_since(t) > Duration::from_secs(30 * (1 + e.failures as u64))).unwrap_or(true)
+                && inner.may_talk_to(&a.ip())
+                && (e.failures < 10 || inner.is_trusted(&a.ip()))
+                && e.last_attempt.map(|t| now.duration_since(t) > Duration::from_secs(30 * (1 + e.failures.min(9) as u64))).unwrap_or(true)
         })
         .map(|(a, _)| *a)
         .collect();

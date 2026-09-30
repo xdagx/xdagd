@@ -146,3 +146,63 @@ fn evm_state_is_rolled_back_on_reorg() {
         .unwrap();
     assert_eq!(alice_rec, alice_before, "alice's account restored exactly");
 }
+
+/// Contract code, storage and receipts are part of a snapshot: a node loaded
+/// from one runs the next call exactly like the node that exported it.
+#[test]
+fn contracts_survive_a_snapshot() {
+    let (mut a, cid) = sim();
+    let mains = a.mine_n(3);
+    let alice = KeyPair::random();
+    let pay = a.payout(mains[0], alice.evm_address(), Nano::from_xdag(100));
+    assert!(a.import(&pay).is_imported());
+    a.mine(&[pay.hashlow()]);
+    a.mine_n(2);
+    let deploy = tx::sign_legacy(&alice, cid, 0, 1_000_000_000, 300_000, None, 0, &counter_initcode());
+    let deploy_hash = tx::decode(&deploy).unwrap().hash;
+    let b1 = run_batch(&mut a, vec![deploy]);
+    a.mine(&[b1]);
+    a.mine_n(2);
+    let contract = xdag_chain::query::receipt(a.chain.db(), &deploy_hash).unwrap().unwrap().contract_address.unwrap();
+    let call = |nonce| tx::sign_eip1559(&alice, cid, nonce, 1_000_000_000, 2_000_000_000, 100_000, Some(contract), 0, b"");
+    let b2 = run_batch(&mut a, vec![call(1)]);
+    a.mine(&[b2]);
+    a.mine_n(2);
+    let counter = |s: &Sim| xdag_chain::query::storage_at(s.chain.db(), &contract, &[0u8; 32]).unwrap()[31];
+    assert_eq!(counter(&a), 1);
+
+    let bytes = xdag_chain::snapshot::export(&mut a.chain, Vec::new()).unwrap();
+    let (mut b, _) = sim();
+    xdag_chain::snapshot::import(&mut b.chain, &mut &bytes[..]).unwrap();
+    b.clock.set(a.now());
+    b.epoch = a.epoch;
+    assert_eq!(counter(&b), 1, "contract storage is carried");
+    assert!(xdag_chain::query::account(b.chain.db(), &contract).unwrap().unwrap().code_hash.is_some(), "and its code");
+    assert!(xdag_chain::query::receipt(b.chain.db(), &deploy_hash).unwrap().is_some(), "and the receipts");
+    assert_eq!(a.state_fingerprint(), b.state_fingerprint());
+
+    // the next call, executed by both nodes (the second one fetches the
+    // blocks it lacks from the first, as a node does on `NoParent`)
+    let (batch, payload) = a.chain.batch_block(&a.miner.clone(), &[NovaTx::Evm(call(2))], a.t(100)).unwrap();
+    assert!(a.import_with(&batch, Some(payload.clone())).is_imported());
+    let mut blocks = vec![a.mine(&[batch.hashlow()])];
+    blocks.extend(a.mine_n(2));
+    for h in blocks {
+        let mut todo = vec![h];
+        while let Some(h) = todo.last().copied() {
+            let blk = a.chain.block(&h).unwrap().expect("known to the first node");
+            let pl = (h == batch.hashlow()).then(|| payload.clone());
+            match b.import_with(&blk, pl) {
+                xdag_chain::ImportOutcome::NoParent(p) => todo.push(p),
+                out => {
+                    assert!(out.is_imported(), "{out:?}");
+                    todo.pop();
+                }
+            }
+        }
+    }
+    b.clock.set(a.now());
+    b.chain.tick().unwrap();
+    assert_eq!((counter(&a), counter(&b)), (2, 2));
+    assert_eq!(a.state_fingerprint(), b.state_fingerprint());
+}

@@ -185,6 +185,11 @@ impl Chain {
         evm: Option<Arc<dyn EvmEngine>>,
         clock: Arc<dyn Clock>,
     ) -> Result<Chain> {
+        if db.get(Table::Meta, keys::META_SNAPSHOT_IMPORT)?.is_some() {
+            return Err(ChainError::Invalid(
+                "a snapshot import into this database did not finish: delete the database file and repeat the import".into(),
+            ));
+        }
         let meta = match db.get(Table::Meta, keys::META_CHAIN)? {
             Some(b) => ChainMeta::decode(&b)?,
             None => ChainMeta::default(),
@@ -850,13 +855,6 @@ impl Chain {
             }
         }
         self.put_info(&hl, info)?;
-        // A block older than the snapshot horizon that shows up only now was
-        // processed (applied or rejected) before the snapshot was taken:
-        // record that, so it can never be applied a second time.
-        if self.meta.snapshot_time > 0 && block.time < self.meta.snapshot_time && self.ov.get(Table::BlockState, &hl.0)?.is_none() {
-            debug_assert!(!self.ov.journaling());
-            self.put_state(&hl, &BlockState { flags: flags::MAIN_REF, ..BlockState::default() })?;
-        }
         self.block_cache.put(hl, block.clone());
         self.meta.nblocks += 1;
         self.mark_meta_dirty();

@@ -20,6 +20,9 @@ use crate::{NetInner, PeerHandle};
 const MAX_SUMS_REQUESTS_PER_ROUND: usize = 512;
 const MAX_WINDOWS_PER_ROUND: usize = 128;
 const SUMS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Do not ask for another window while this many blocks await import.
+const MAX_IMPORT_BACKLOG: usize = 20_000;
+const BACKLOG_PATIENCE: Duration = Duration::from_secs(300);
 const RANGE_TIMEOUT: Duration = Duration::from_secs(64);
 
 pub(crate) async fn run(inner: Arc<NetInner>) {
@@ -68,13 +71,33 @@ async fn request_range(inner: &Arc<NetInner>, p: &Arc<PeerHandle>, start: u64, e
         inner.pending_ranges.lock().remove(&random);
         return Err("send failed".into());
     }
-    match tokio::time::timeout(RANGE_TIMEOUT, rx).await {
+    p.ranges_pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let done = tokio::time::timeout(RANGE_TIMEOUT, rx).await;
+    p.ranges_pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    match done {
         Ok(Ok(())) => Ok(()),
         _ => {
             inner.pending_ranges.lock().remove(&random);
             Err("range timeout".into())
         }
     }
+}
+
+/// The 16 sub-ranges of `[t, t + dt)` worth descending into: those whose sums
+/// differ and that end after `last_time`.
+///
+/// Only windows ending after the last main block are ever fetched (as in
+/// xdagj), so a range that ends at or before it cannot contribute one. It must
+/// not be explored either: a node bootstrapped from a pruned snapshot lacks old
+/// blocks its peers still have, differs from them in every old range, and
+/// would spend the whole round budget there without reaching the recent ranges.
+fn differing_subranges(t: u64, dt: u64, local: &[u8], remote: &[u8], last_time: u64) -> Vec<(u64, u64)> {
+    let sub = dt >> 4;
+    (0..16usize)
+        .filter(|i| local[i * 16..i * 16 + 16] != remote[i * 16..i * 16 + 16])
+        .map(|i| (t + i as u64 * sub, sub))
+        .filter(|(start, sub)| start + sub > last_time)
+        .collect()
 }
 
 pub(crate) async fn sync_with(inner: &Arc<NetInner>, p: &Arc<PeerHandle>) -> Result<usize, String> {
@@ -93,15 +116,8 @@ pub(crate) async fn sync_with(inner: &Arc<NetInner>, p: &Arc<PeerHandle>) -> Res
             if remote.len() != 256 {
                 return Err("bad sums reply".into());
             }
-            let sub = dt >> 4;
             // push in reverse so that older ranges are explored first
-            for i in (0..16).rev() {
-                let a = &local[i * 16..i * 16 + 16];
-                let b = &remote[i * 16..i * 16 + 16];
-                if a != b {
-                    stack.push((t + i as u64 * sub, sub));
-                }
-            }
+            stack.extend(differing_subranges(t, dt, &local, &remote, last_time).into_iter().rev());
         } else if t + dt > last_time {
             windows.push(t);
             if windows.len() >= MAX_WINDOWS_PER_ROUND {
@@ -112,10 +128,49 @@ pub(crate) async fn sync_with(inner: &Arc<NetInner>, p: &Arc<PeerHandle>) -> Res
     windows.sort_unstable();
     let n = windows.len();
     for t in windows {
+        // importing can be much slower than fetching (RandomX): keep pace with it
+        let waiting = std::time::Instant::now();
+        while inner.chain.import_backlog() > MAX_IMPORT_BACKLOG {
+            if waiting.elapsed() > BACKLOG_PATIENCE {
+                return Err("import does not keep up".into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         request_range(inner, p, t, t + MAX_RANGE as u64).await?;
     }
     if n > 0 {
         tracing::debug!(peer = %p.peer_id, windows = n, sums_requests = requests, "sync round done");
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sums(nonzero: &[usize]) -> Vec<u8> {
+        let mut s = vec![0u8; 256];
+        for i in nonzero {
+            s[i * 16] = 1;
+        }
+        s
+    }
+
+    #[test]
+    fn only_differing_ranges_after_the_last_main_block_are_explored() {
+        let (t, dt) = (1u64 << 32, 1u64 << 28);
+        let sub = dt >> 4;
+        let local = sums(&[]);
+        let remote = sums(&[0, 1, 5, 9, 15]);
+        // a fresh node explores every differing range
+        assert_eq!(differing_subranges(t, dt, &local, &remote, 0).len(), 5);
+        // last main block inside sub-range 5: older ranges are skipped, the
+        // one containing it and the later ones are kept
+        let last = t + 5 * sub + 17;
+        assert_eq!(differing_subranges(t, dt, &local, &remote, last), vec![(t + 5 * sub, sub), (t + 9 * sub, sub), (t + 15 * sub, sub)]);
+        // a range ending exactly at the last main block holds nothing newer
+        assert_eq!(differing_subranges(t, dt, &local, &remote, t + 6 * sub), vec![(t + 9 * sub, sub), (t + 15 * sub, sub)]);
+        // equal sums are never explored
+        assert!(differing_subranges(t, dt, &remote, &remote, 0).is_empty());
+    }
 }

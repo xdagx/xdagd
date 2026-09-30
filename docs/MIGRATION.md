@@ -13,7 +13,21 @@
 
 如果在 Nova 激活之前开放网络，任何拥有 SHA256 矿机的人都可以抢主块、回滚历史。
 
-## 阶段 0：准备（预计数周）
+## 阶段 0：验证与准备（预计数周）
+
+xdagd 目前**还没有和真实的 xdagj 节点、真实的主网数据对接过**。在动任何生产节点之前，先按下面的顺序验证；
+这三步都不会影响主网（xdagd 在主网模式下默认不出块、不发交易，Nova 不激活，只按 xdagj 的规则验证和转发）。
+
+1. **本机对接 xdagj 开发网**：起一个 xdagj 开发网节点（白名单里加上 xdagd 的地址）和一个 xdagd 开发网节点（关闭 Nova），
+   验证握手、区块广播、范围同步，以及导出工具能否在真实的 xdagj 数据库上编译和运行。
+2. **主网只读跟随**：在一台 xdagj 主网节点上停机导出（阶段 1 的命令），把快照导入一个新的 xdagd 节点，
+   让它连接这台 xdagj 节点（xdagj 的 `node.whiteIPs` 里加上 xdagd 的 IP）并持续同步。xdagd 不能直接从零同步主网：
+   xdagj 节点自己就是从余额快照启动的，没有快照之前的区块。
+3. **长期比对**：让 xdagd 跟随主网运行数周，定期比对两边的主块高度、主块哈希、主块余额和抽样账户余额。
+   任何差异都说明移植有缺陷，需要在切换前修复。导入时 xdagd 会重新解析并验签快照里每一个带数据的区块，
+   这本身就是对主网历史区块的一次兼容性检查。
+
+同时进行：
 
 - 安全审计：共识（`crates/chain`）、P2P（`crates/net`）、EVM 集成（`crates/evm`）、导出工具。
 - 确定并写死主网参数：Nova `activation_epoch`、`chain_id`（默认预留 30820）、`min_native_fee`、`min_gas_price`、`min_link_pow_bits`。
@@ -32,23 +46,27 @@ java -Xmx4g -cp xdagj-0.8.4-executable.jar:out XdagjExporter \
 sha256sum state.xsnp
 ```
 
-- 在同一主块高度停止的不同节点导出的快照，内容应当完全一致（`sha256sum` 相同）。建议由多个运营方独立导出并公布哈希，
-  作为迁移的"新起点"。
+- 快照携带节点知道的全部区块和全部账户，不做裁剪（原因见 DESIGN.md 第 5 节），大小与 xdagj 的 `BLOCK` 库相当。
+- `xdagd snapshot info state.xsnp` 会打印快照的主块高度、各部分的条数和**账户部分的摘要**。
+  在同一主块高度停止的不同节点，账户摘要应当相同（区块部分可能因各节点持有的未确认区块不同而略有差异）。
+  建议由多个运营方独立导出并公布账户摘要，作为迁移的"新起点"。
 - 导入新节点并核对：
 
 ```bash
-xdagd --network mainnet snapshot import state.xsnp
+xdagd --network mainnet snapshot import state.xsnp      # 全新的数据目录
 xdagd --network mainnet archive import-raw blocks.dat [旧 C 版 storage/**/*.dat ...]
 xdagd --network mainnet status
 ```
 
-  逐项比对：主块高度、顶端区块、每个账户的余额与 nonce（可以用 RPC 批量比对 `xdag_getBalance`）、主块余额、账户余额总和。
+  逐项比对：主块高度、顶端区块、抽样账户的余额与 nonce（`xdag_getBalance`、`xdag_getTransactionNonce`）、主块的哈希与余额。
 
 ## 阶段 2：白名单节点切换到 xdagd
 
 - 所有白名单运营方停止 xdagj，用阶段 1 发布的快照启动 xdagd（`snapshot import` 后 `run`）。
 - xdagd 在 P2P 层与 xdagj 兼容，所以也可以逐个节点切换：未切换的 xdagj 节点仍能与已切换的节点同步。
   但注意 xdagj 节点仍受白名单限制，需要把 xdagd 节点的 IP 加入 xdagj 的白名单。
+- Nova 激活之前，xdagd 自己也是封闭的：只和 `p2p.seeds`、`p2p.allow` 里的节点通信。各运营方把彼此的节点写进这两项，
+  相当于继续沿用现有的白名单；不需要、也不应该在这个阶段用 `allow = ["0.0.0.0"]` 打开它。
 - 矿池：xdagd 提供与 xdagj 相同的 WebSocket 矿池接口（`[pool] enabled = true`），矿池软件无需修改；
   也可以使用内置矿工。
 - 钱包：`wallet.data` 与 xdagj 互通，直接复制到 `<datadir>/wallet/wallet.data`，通过 `XDAG_WALLET_PASSWORD` 提供密码。
@@ -71,7 +89,9 @@ xdagd --network mainnet status
 
 ## 阶段 4：开放网络
 
+- Nova 激活后 xdagd 自动转为开放模式（运营方此时应清空 `p2p.allow`，否则节点仍只和列表里的节点通信）。
 - 发布种子节点列表；任何人都可以运行 `xdagd --network mainnet run` 加入网络。
+  新节点需要一份状态才能起步：某个节点用 `xdagd snapshot export` 导出的快照，或者直接复制的数据库文件。
 - 运营建议：
   - 对外只开放 P2P 端口；RPC 默认只监听 `127.0.0.1`，对外提供 RPC 时放在反向代理之后并限流；
   - 矿池接口只允许自己的矿池连接（`[pool] allowed`）。
